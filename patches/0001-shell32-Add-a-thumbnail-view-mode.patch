@@ -1,0 +1,1761 @@
+From 8565e9b4f6db9e4f0634b72c0acf6f0dc864b67b Mon Sep 17 00:00:00 2001
+From: wine-thumbs <wine-thumbs@localhost>
+Date: Fri, 18 Sep 2026 16:19:26 +0200
+Subject: [PATCH 1/4] shell32: Add a thumbnail view mode.
+
+FVM_THUMBNAIL was accepted but drawn like the list view. Image files are
+now decoded with WIC on a small pool of background threads, downscaled
+with an area-averaging filter (the WIC scaler only does nearest
+neighbour), oriented according to EXIF and kept in a process-wide cache.
+Other items show their shell icon rendered from the 256px image list.
+
+The list view keeps doing layout, labels and selection; items are drawn
+through custom draw so thumbnails are not tinted by the selection blend.
+The size can be changed with HKCU\Software\Wine\Thumbnails "Size" (in
+96 DPI pixels, default 96) and the cache with "CacheSize" (MB, default 64).
+---
+ dlls/shell32/Makefile.in      |    1 +
+ dlls/shell32/shell32.rc       |    2 +
+ dlls/shell32/shlview.c        |   69 +-
+ dlls/shell32/shlview_thumbs.c | 1469 +++++++++++++++++++++++++++++++++
+ dlls/shell32/shlview_thumbs.h |   33 +
+ include/shlobj.h              |    2 +
+ 6 files changed, 1557 insertions(+), 19 deletions(-)
+ create mode 100644 dlls/shell32/shlview_thumbs.c
+ create mode 100644 dlls/shell32/shlview_thumbs.h
+
+diff --git a/dlls/shell32/Makefile.in b/dlls/shell32/Makefile.in
+index 8cd31710..3112d64a 100644
+--- a/dlls/shell32/Makefile.in
++++ b/dlls/shell32/Makefile.in
+@@ -97,5 +97,6 @@ SOURCES = \
+ 	shlmenu.c \
+ 	shlview.c \
+ 	shlview_cmenu.c \
++	shlview_thumbs.c \
+ 	shpolicy.c \
+ 	systray.c
+diff --git a/dlls/shell32/shell32.rc b/dlls/shell32/shell32.rc
+index c09f8e44..07896bd7 100644
+--- a/dlls/shell32/shell32.rc
++++ b/dlls/shell32/shell32.rc
+@@ -30,6 +30,7 @@ BEGIN
+ 	MENUITEM "S&mall Icons",	FCIDM_SHVIEW_SMALLICON
+ 	MENUITEM "&List",		FCIDM_SHVIEW_LISTVIEW
+ 	MENUITEM "&Details",		FCIDM_SHVIEW_REPORTVIEW
++	MENUITEM "&Thumbnails",		FCIDM_SHVIEW_THUMBNAIL
+ END
+ 
+ /*
+@@ -45,6 +46,7 @@ BEGIN
+ 	    MENUITEM "S&mall Icons",	FCIDM_SHVIEW_SMALLICON
+ 	    MENUITEM "&List",		FCIDM_SHVIEW_LISTVIEW
+ 	    MENUITEM "&Details",	FCIDM_SHVIEW_REPORTVIEW
++	    MENUITEM "&Thumbnails",	FCIDM_SHVIEW_THUMBNAIL
+ 	  END
+ 	  MENUITEM SEPARATOR
+ 	  POPUP "Arrange &Icons",       0x41
+diff --git a/dlls/shell32/shlview.c b/dlls/shell32/shlview.c
+index b1524b1f..ced56bed 100644
+--- a/dlls/shell32/shlview.c
++++ b/dlls/shell32/shlview.c
+@@ -61,6 +61,7 @@
+ #include "pidl.h"
+ #include "shell32_main.h"
+ #include "shellfolder.h"
++#include "shlview_thumbs.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(shell);
+ 
+@@ -144,6 +145,7 @@ typedef struct
+         UINT            cScrollDelay;   /* Send a WM_*SCROLL msg every 250 ms during drag-scroll */
+         POINT           ptLastMousePos; /* Mouse position at last DragOver call */
+         UINT            columns;        /* Number of shell folder columns */
++        struct thumbnail_view *thumbnails; /* Set while in FVM_THUMBNAIL mode */
+ } IShellViewImpl;
+ 
+ static inline IShellViewImpl *impl_from_IShellView3(IShellView3 *iface)
+@@ -299,10 +301,14 @@ static void CheckToolbar(IShellViewImpl * This)
+                 FCIDM_TB_SMALLICON, This->FolderSettings.ViewMode == FVM_LIST, &result);
+ 	  IShellBrowser_SendControlMsg(This->pShellBrowser, FCW_TOOLBAR, TB_CHECKBUTTON,
+                 FCIDM_TB_REPORTVIEW, This->FolderSettings.ViewMode == FVM_DETAILS, &result);
++	  IShellBrowser_SendControlMsg(This->pShellBrowser, FCW_TOOLBAR, TB_CHECKBUTTON,
++                FCIDM_TB_THUMBNAILVIEW, This->FolderSettings.ViewMode == FVM_THUMBNAIL, &result);
+ 	  IShellBrowser_SendControlMsg(This->pShellBrowser, FCW_TOOLBAR, TB_ENABLEBUTTON,
+ 		FCIDM_TB_SMALLICON, TRUE, &result);
+ 	  IShellBrowser_SendControlMsg(This->pShellBrowser, FCW_TOOLBAR, TB_ENABLEBUTTON,
+ 		FCIDM_TB_REPORTVIEW, TRUE, &result);
++	  IShellBrowser_SendControlMsg(This->pShellBrowser, FCW_TOOLBAR, TB_ENABLEBUTTON,
++		FCIDM_TB_THUMBNAILVIEW, TRUE, &result);
+ 	}
+ }
+ 
+@@ -335,6 +341,7 @@ static DWORD ViewModeToListStyle(UINT ViewMode)
+ 	  case FVM_DETAILS:	dwStyle = LVS_REPORT;		break;
+ 	  case FVM_SMALLICON:	dwStyle = LVS_SMALLICON;	break;
+ 	  case FVM_LIST:	dwStyle = LVS_LIST;		break;
++	  case FVM_THUMBNAIL:	dwStyle = LVS_ICON;		break;
+ 	  default:
+ 	  {
+ 		FIXME("ViewMode %d not implemented\n", ViewMode);
+@@ -699,6 +706,30 @@ static HRESULT ShellView_FillList(IShellViewImpl *This)
+     return S_OK;
+ }
+ 
++/**********************************************************
++ *	switch the view mode, entering or leaving thumbnail drawing
++ */
++static void ShellView_SetViewMode(IShellViewImpl *This, UINT mode)
++{
++    This->FolderSettings.ViewMode = mode;
++
++    if (This->hWndList)
++    {
++        if (mode == FVM_THUMBNAIL && !This->thumbnails)
++            This->thumbnails = thumbnail_view_create(This->hWndList, This->pSFParent);
++        else if (mode != FVM_THUMBNAIL && This->thumbnails)
++        {
++            thumbnail_view_destroy(This->thumbnails);
++            This->thumbnails = NULL;
++        }
++
++        /* thumbnails flow in rows like Explorer, the other modes keep the historical layout */
++        SetStyle(This, ViewModeToListStyle(mode) | (mode == FVM_THUMBNAIL ? LVS_ALIGNTOP : LVS_ALIGNLEFT),
++                LVS_TYPEMASK | LVS_ALIGNMASK);
++    }
++    CheckToolbar(This);
++}
++
+ /**********************************************************
+ *  ShellView_OnCreate()
+ */
+@@ -714,6 +745,8 @@ static LRESULT ShellView_OnCreate(IShellViewImpl *This)
+     if (ShellView_CreateList(This))
+     {
+         ShellView_InitList(This);
++        if (This->FolderSettings.ViewMode == FVM_THUMBNAIL)
++            ShellView_SetViewMode(This, FVM_THUMBNAIL);
+         ShellView_FillList(This);
+     }
+ 
+@@ -1256,27 +1289,23 @@ static LRESULT ShellView_OnCommand(IShellViewImpl * This,DWORD dwCmdID, DWORD dw
+ 	switch(dwCmdID)
+ 	{
+ 	  case FCIDM_SHVIEW_SMALLICON:
+-	    This->FolderSettings.ViewMode = FVM_SMALLICON;
+-	    SetStyle (This, LVS_SMALLICON, LVS_TYPEMASK);
+-	    CheckToolbar(This);
++	    ShellView_SetViewMode(This, FVM_SMALLICON);
+ 	    break;
+ 
+ 	  case FCIDM_SHVIEW_BIGICON:
+-	    This->FolderSettings.ViewMode = FVM_ICON;
+-	    SetStyle (This, LVS_ICON, LVS_TYPEMASK);
+-	    CheckToolbar(This);
++	    ShellView_SetViewMode(This, FVM_ICON);
+ 	    break;
+ 
+ 	  case FCIDM_SHVIEW_LISTVIEW:
+-	    This->FolderSettings.ViewMode = FVM_LIST;
+-	    SetStyle (This, LVS_LIST, LVS_TYPEMASK);
+-	    CheckToolbar(This);
++	    ShellView_SetViewMode(This, FVM_LIST);
+ 	    break;
+ 
+ 	  case FCIDM_SHVIEW_REPORTVIEW:
+-	    This->FolderSettings.ViewMode = FVM_DETAILS;
+-	    SetStyle (This, LVS_REPORT, LVS_TYPEMASK);
+-	    CheckToolbar(This);
++	    ShellView_SetViewMode(This, FVM_DETAILS);
++	    break;
++
++	  case FCIDM_SHVIEW_THUMBNAIL:
++	    ShellView_SetViewMode(This, FVM_THUMBNAIL);
+ 	    break;
+ 
+ 	  /* the menu IDs for sorting are 0x30... see shell32.rc */
+@@ -1323,6 +1352,8 @@ static LRESULT ShellView_OnNotify(IShellViewImpl * This, UINT CtlID, LPNMHDR lpn
+ 
+ 	  case NM_CUSTOMDRAW:
+ 	    TRACE("-- NM_CUSTOMDRAW %p\n",This);
++	    if (This->thumbnails)
++	      return thumbnail_view_custom_draw(This->thumbnails, (NMLVCUSTOMDRAW *)lpnmh);
+ 	    return CDRF_DODEFAULT;
+ 
+ 	  case NM_RELEASEDCAPTURE:
+@@ -1438,7 +1469,10 @@ static LRESULT ShellView_OnNotify(IShellViewImpl * This, UINT CtlID, LPNMHDR lpn
+ 
+ 	    if(lpdi->item.mask & LVIF_IMAGE)	/* image requested */
+ 	    {
+-	      lpdi->item.iImage = SHMapPIDLToSystemImageListIndex(This->pSFParent, pidl, 0);
++	      if (This->thumbnails)
++	        lpdi->item.iImage = I_IMAGENONE;
++	      else
++	        lpdi->item.iImage = SHMapPIDLToSystemImageListIndex(This->pSFParent, pidl, 0);
+ 	    }
+ 	    break;
+ 
+@@ -1698,6 +1732,8 @@ static LRESULT CALLBACK ShellView_WndProc(HWND hWnd, UINT uMessage, WPARAM wPara
+ 	  case WM_DESTROY:	
+ 				SHChangeNotifyDeregister(pThis->hNotify);
+ 				RevokeDragDrop(pThis->hWnd);
++				thumbnail_view_destroy(pThis->thumbnails);
++				pThis->thumbnails = NULL;
+ 	                        break;
+ 
+ 	  case WM_ERASEBKGND:
+@@ -2693,7 +2729,6 @@ static HRESULT WINAPI FolderView_GetCurrentViewMode(IFolderView2 *iface, UINT *m
+ static HRESULT WINAPI FolderView_SetCurrentViewMode(IFolderView2 *iface, UINT mode)
+ {
+     IShellViewImpl *shellview = impl_from_IFolderView2(iface);
+-    DWORD style;
+ 
+     TRACE("folder view %p, mode %u.\n", iface, mode);
+ 
+@@ -2701,11 +2736,7 @@ static HRESULT WINAPI FolderView_SetCurrentViewMode(IFolderView2 *iface, UINT mo
+         mode = FVM_ICON;
+ 
+     if (mode >= FVM_FIRST && mode <= FVM_LAST)
+-    {
+-        style = ViewModeToListStyle(mode);
+-        SetStyle(shellview, style, LVS_TYPEMASK);
+-        shellview->FolderSettings.ViewMode = mode;
+-    }
++        ShellView_SetViewMode(shellview, mode);
+ 
+     return S_OK;
+ }
+diff --git a/dlls/shell32/shlview_thumbs.c b/dlls/shell32/shlview_thumbs.c
+new file mode 100644
+index 00000000..33f059eb
+--- /dev/null
++++ b/dlls/shell32/shlview_thumbs.c
+@@ -0,0 +1,1469 @@
++/*
++ * Thumbnail view mode for the shell view
++ *
++ * Image files are decoded with WIC on a background thread, downscaled with
++ * an area-averaging filter and cached process-wide; other items show their
++ * shell icon rendered at thumbnail size. The list view keeps doing layout,
++ * labels, selection and keyboard handling; items are drawn through custom
++ * draw so thumbnails are never tinted by the selection blend.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define COBJMACROS
++
++#include "windef.h"
++#include "winbase.h"
++#include "wingdi.h"
++#include "winuser.h"
++#include "winreg.h"
++#include "objbase.h"
++#include "commctrl.h"
++#include "commoncontrols.h"
++#include "shlobj.h"
++#include "shellapi.h"
++#include "shlwapi.h"
++#include "wine/debug.h"
++#include "wine/list.h"
++#include "wine/rbtree.h"
++
++#include "pidl.h"
++#include "shell32_main.h"
++#include "shlview_thumbs.h"
++
++/* wincodec GUIDs are not part of libuuid */
++#include "initguid.h"
++#include "wincodec.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(thumbnail);
++
++#define WM_THUMBNAIL_FLUSH (WM_USER + 1)
++#define WM_THUMBNAIL_READY (WM_USER + 2)
++
++#define DEFAULT_THUMBNAIL_SIZE 96
++#define MIN_THUMBNAIL_SIZE     32
++#define MAX_THUMBNAIL_SIZE     256
++#define DEFAULT_CACHE_MB       64
++#define MAX_SOURCE_DIMENSION   65535
++#define MAX_SOURCE_PIXELS      (100u * 1000 * 1000)
++#define BAND_BYTES             (4 << 20)
++
++static DWORD get_setting(const WCHAR *name, DWORD def)
++{
++    DWORD value, size = sizeof(value);
++
++    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Wine\\Thumbnails", name,
++            RRF_RT_REG_DWORD, NULL, &value, &size))
++        return def;
++    return value;
++}
++
++/*
++ * Area-averaging resampler for premultiplied BGRA.
++ *
++ * Source rows are pushed one at a time, so images can be streamed from the
++ * decoder in bands. Every destination pixel is the exact area-weighted mean
++ * of the source pixels it covers, which keeps text in screenshots legible
++ * where nearest-neighbour sampling would turn it into noise.
++ */
++struct resampler
++{
++    UINT src_w, src_h, dst_w, dst_h;
++    BYTE *dst;
++    UINT *x_first;
++    UINT *x_count;
++    float *x_weights;
++    float *row;
++    float *acc[2];
++    UINT acc_row;   /* destination row accumulated in acc[0] */
++    UINT src_row;   /* source rows pushed so far */
++    double y_scale;
++    BOOL opaque;
++};
++
++static void resampler_cleanup(struct resampler *rs)
++{
++    free(rs->x_first);
++    free(rs->x_count);
++    free(rs->x_weights);
++    free(rs->row);
++    free(rs->acc[0]);
++    free(rs->acc[1]);
++}
++
++static BOOL resampler_init(struct resampler *rs, UINT src_w, UINT src_h, UINT dst_w, UINT dst_h, BYTE *dst)
++{
++    double scale = (double)src_w / dst_w;
++    UINT x, i, total = 0;
++
++    memset(rs, 0, sizeof(*rs));
++    rs->src_w = src_w;
++    rs->src_h = src_h;
++    rs->dst_w = dst_w;
++    rs->dst_h = dst_h;
++    rs->dst = dst;
++    rs->y_scale = (double)src_h / dst_h;
++    rs->opaque = TRUE;
++
++    rs->x_first = malloc(dst_w * sizeof(*rs->x_first));
++    rs->x_count = malloc(dst_w * sizeof(*rs->x_count));
++    rs->x_weights = malloc((src_w + 2 * dst_w) * sizeof(*rs->x_weights));
++    rs->row = malloc(dst_w * 4 * sizeof(*rs->row));
++    rs->acc[0] = calloc(dst_w * 4, sizeof(*rs->acc[0]));
++    rs->acc[1] = calloc(dst_w * 4, sizeof(*rs->acc[1]));
++    if (!rs->x_first || !rs->x_count || !rs->x_weights || !rs->row || !rs->acc[0] || !rs->acc[1])
++    {
++        resampler_cleanup(rs);
++        return FALSE;
++    }
++
++    for (x = 0; x < dst_w; x++)
++    {
++        double start = x * scale, end = (x + 1) * scale;
++        UINT first = (UINT)start, last = (UINT)end;
++
++        if (last < end) last++;
++        if (last > src_w) last = src_w;
++        if (first >= last) first = last - 1;
++
++        rs->x_first[x] = first;
++        rs->x_count[x] = last - first;
++        for (i = first; i < last; i++)
++        {
++            double lo = max(start, (double)i), hi = min(end, (double)(i + 1));
++            rs->x_weights[total++] = (float)((hi - lo) / scale);
++        }
++    }
++    return TRUE;
++}
++
++static inline BYTE clamp_byte(float value)
++{
++    value += 0.5f;
++    if (value <= 0.0f) return 0;
++    if (value >= 255.0f) return 255;
++    return (BYTE)value;
++}
++
++static void resampler_emit_row(struct resampler *rs)
++{
++    BYTE *out = rs->dst + (SIZE_T)rs->acc_row * rs->dst_w * 4;
++    float *acc = rs->acc[0];
++    UINT x;
++
++    for (x = 0; x < rs->dst_w; x++, out += 4, acc += 4)
++    {
++        BYTE alpha = clamp_byte(acc[3]);
++
++        /* premultiplied colour must not exceed alpha after rounding */
++        out[0] = min(clamp_byte(acc[0]), alpha);
++        out[1] = min(clamp_byte(acc[1]), alpha);
++        out[2] = min(clamp_byte(acc[2]), alpha);
++        out[3] = alpha;
++        if (alpha != 255) rs->opaque = FALSE;
++    }
++
++    acc = rs->acc[0];
++    rs->acc[0] = rs->acc[1];
++    rs->acc[1] = acc;
++    memset(acc, 0, rs->dst_w * 4 * sizeof(*acc));
++    rs->acc_row++;
++}
++
++static void resampler_push_row(struct resampler *rs, const BYTE *src)
++{
++    const float *weight = rs->x_weights;
++    UINT x, i, row, dst_row;
++
++    if (rs->src_row >= rs->src_h) return;
++    row = rs->src_row++;
++
++    for (x = 0; x < rs->dst_w; x++)
++    {
++        const BYTE *p = src + rs->x_first[x] * 4;
++        float b = 0.0f, g = 0.0f, r = 0.0f, a = 0.0f;
++
++        for (i = 0; i < rs->x_count[x]; i++, p += 4, weight++)
++        {
++            b += p[0] * *weight;
++            g += p[1] * *weight;
++            r += p[2] * *weight;
++            a += p[3] * *weight;
++        }
++        rs->row[x * 4] = b;
++        rs->row[x * 4 + 1] = g;
++        rs->row[x * 4 + 2] = r;
++        rs->row[x * 4 + 3] = a;
++    }
++
++    /* first destination row covering source row [row, row + 1); the division
++     * can round across a row boundary, so settle it with the same arithmetic
++     * as the weights below */
++    dst_row = min((UINT)(row / rs->y_scale), rs->dst_h - 1);
++    while (dst_row && dst_row * rs->y_scale > row) dst_row--;
++    while (dst_row + 1 < rs->dst_h && (dst_row + 1) * rs->y_scale <= row) dst_row++;
++    while (rs->acc_row < dst_row) resampler_emit_row(rs);
++
++    /* the source row overlaps at most two destination rows */
++    for (; dst_row < rs->dst_h && dst_row <= rs->acc_row + 1; dst_row++)
++    {
++        double lo = max((double)row, dst_row * rs->y_scale);
++        double hi = min((double)(row + 1), (dst_row + 1) * rs->y_scale);
++        float *acc = rs->acc[dst_row - rs->acc_row], w;
++
++        if (hi <= lo) break;
++        w = (float)((hi - lo) / rs->y_scale);
++        for (x = 0; x < rs->dst_w * 4; x++) acc[x] += rs->row[x] * w;
++    }
++}
++
++static void resampler_finish(struct resampler *rs)
++{
++    while (rs->acc_row < rs->dst_h) resampler_emit_row(rs);
++}
++
++static BYTE *resample(const BYTE *src, UINT src_w, UINT src_h, UINT dst_w, UINT dst_h, BOOL *opaque)
++{
++    struct resampler rs;
++    BYTE *dst;
++    UINT y;
++
++    if (!(dst = malloc((SIZE_T)dst_w * dst_h * 4))) return NULL;
++    if (!resampler_init(&rs, src_w, src_h, dst_w, dst_h, dst))
++    {
++        free(dst);
++        return NULL;
++    }
++    for (y = 0; y < src_h; y++) resampler_push_row(&rs, src + (SIZE_T)y * src_w * 4);
++    resampler_finish(&rs);
++    if (opaque) *opaque = rs.opaque;
++    resampler_cleanup(&rs);
++    return dst;
++}
++
++/* EXIF orientation (TIFF tag 0x0112) of a JPEG or TIFF file, 1 if absent. */
++static UINT get_u16(const BYTE *p, BOOL big_endian)
++{
++    return big_endian ? (p[0] << 8) | p[1] : p[0] | (p[1] << 8);
++}
++
++static UINT get_u32(const BYTE *p, BOOL big_endian)
++{
++    return big_endian ? ((UINT)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]
++                      : p[0] | (p[1] << 8) | (p[2] << 16) | ((UINT)p[3] << 24);
++}
++
++static UINT tiff_orientation(const BYTE *tiff, SIZE_T len)
++{
++    UINT ifd, count, i, value;
++    BOOL big_endian;
++
++    if (len < 8) return 1;
++    if (!memcmp(tiff, "II*\0", 4)) big_endian = FALSE;
++    else if (!memcmp(tiff, "MM\0*", 4)) big_endian = TRUE;
++    else return 1;
++
++    ifd = get_u32(tiff + 4, big_endian);
++    if (ifd < 8 || ifd > len - 2) return 1;
++    count = get_u16(tiff + ifd, big_endian);
++
++    for (i = 0; i < count && ifd + 2 + (i + 1) * 12 <= len; i++)
++    {
++        const BYTE *entry = tiff + ifd + 2 + i * 12;
++
++        if (get_u16(entry, big_endian) != 0x0112) continue;
++        if (get_u16(entry + 2, big_endian) != 3 /* SHORT */ || get_u32(entry + 4, big_endian) != 1) break;
++        value = get_u16(entry + 8, big_endian);
++        return value >= 1 && value <= 8 ? value : 1;
++    }
++    return 1;
++}
++
++static UINT read_orientation(const WCHAR *path)
++{
++    static const SIZE_T header_size = 0x20000;
++    UINT orientation = 1;
++    SIZE_T pos = 2;
++    HANDLE file;
++    DWORD len;
++    BYTE *data;
++
++    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++            NULL, OPEN_EXISTING, 0, NULL);
++    if (file == INVALID_HANDLE_VALUE) return 1;
++    if (!(data = malloc(header_size)) || !ReadFile(file, data, header_size, &len, NULL)) len = 0;
++    CloseHandle(file);
++
++    if (len >= 4 && data[0] == 0xff && data[1] == 0xd8)
++    {
++        while (pos + 4 <= len && data[pos] == 0xff)
++        {
++            BYTE marker = data[pos + 1];
++            UINT segment;
++
++            if (marker == 0xff) { pos++; continue; } /* fill byte */
++            if (marker == 0xd9 || marker == 0xda) break; /* end of image, start of scan */
++            if (marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { pos += 2; continue; }
++
++            segment = (data[pos + 2] << 8) | data[pos + 3];
++            if (segment < 2) break;
++            if (marker == 0xe1 && segment >= 8 && pos + 10 <= len && !memcmp(data + pos + 4, "Exif\0\0", 6))
++            {
++                orientation = tiff_orientation(data + pos + 10, min(segment - 8, len - (pos + 10)));
++                break;
++            }
++            pos += 2 + segment;
++        }
++    }
++    else if (len)
++    {
++        orientation = tiff_orientation(data, len);
++    }
++
++    free(data);
++    return orientation;
++}
++
++/* Returns a new buffer holding the image as it should be displayed. */
++static BYTE *apply_orientation(const BYTE *src, UINT w, UINT h, UINT orientation, UINT *out_w, UINT *out_h)
++{
++    const DWORD *s = (const DWORD *)src;
++    UINT x, y, sx, sy, dw, dh;
++    DWORD *d;
++
++    dw = orientation >= 5 ? h : w;
++    dh = orientation >= 5 ? w : h;
++    if (!(d = malloc((SIZE_T)dw * dh * 4))) return NULL;
++
++    for (y = 0; y < dh; y++)
++    {
++        for (x = 0; x < dw; x++)
++        {
++            switch (orientation)
++            {
++            case 2:  sx = w - 1 - x; sy = y;         break; /* mirror horizontal */
++            case 3:  sx = w - 1 - x; sy = h - 1 - y; break; /* rotate 180 */
++            case 4:  sx = x;         sy = h - 1 - y; break; /* mirror vertical */
++            case 5:  sx = y;         sy = x;         break; /* transpose */
++            case 6:  sx = y;         sy = h - 1 - x; break; /* rotate 90 clockwise */
++            case 7:  sx = w - 1 - y; sy = h - 1 - x; break; /* transverse */
++            case 8:  sx = w - 1 - y; sy = x;         break; /* rotate 90 counter-clockwise */
++            default: sx = x;         sy = y;         break;
++            }
++            d[(SIZE_T)y * dw + x] = s[(SIZE_T)sy * w + sx];
++        }
++    }
++
++    *out_w = dw;
++    *out_h = dh;
++    return (BYTE *)d;
++}
++
++static HBITMAP create_dib(UINT width, UINT height, const BYTE *bits)
++{
++    BITMAPINFO info;
++    HBITMAP bitmap;
++    void *dib_bits;
++
++    memset(&info, 0, sizeof(info));
++    info.bmiHeader.biSize = sizeof(info.bmiHeader);
++    info.bmiHeader.biWidth = width;
++    info.bmiHeader.biHeight = -(LONG)height;
++    info.bmiHeader.biPlanes = 1;
++    info.bmiHeader.biBitCount = 32;
++    info.bmiHeader.biCompression = BI_RGB;
++
++    if (!(bitmap = CreateDIBSection(NULL, &info, DIB_RGB_COLORS, &dib_bits, NULL, 0))) return NULL;
++    if (bits) memcpy(dib_bits, bits, (SIZE_T)width * height * 4);
++    else memset(dib_bits, 0, (SIZE_T)width * height * 4);
++    return bitmap;
++}
++
++/*
++ * Process-wide thumbnail cache, keyed by path, modification time, file size
++ * and thumbnail box size. Files without a thumbnail are cached as well so
++ * they are not probed again.
++ */
++struct thumbnail_key
++{
++    const WCHAR *path;
++    ULONGLONG mtime;
++    ULONGLONG size;
++    UINT box;
++};
++
++struct thumbnail
++{
++    LONG refcount;
++    struct rb_entry entry;
++    struct list lru_entry;
++    struct thumbnail_key key;
++    HBITMAP bitmap;     /* premultiplied top-down DIB, NULL if the file has no thumbnail */
++    UINT width, height;
++    BOOL opaque;
++    SIZE_T cost;
++};
++
++static int thumbnail_compare(const void *key, const struct rb_entry *entry)
++{
++    const struct thumbnail_key *a = key, *b = &RB_ENTRY_VALUE(entry, const struct thumbnail, entry)->key;
++
++    if (a->box != b->box) return a->box < b->box ? -1 : 1;
++    if (a->mtime != b->mtime) return a->mtime < b->mtime ? -1 : 1;
++    if (a->size != b->size) return a->size < b->size ? -1 : 1;
++    return wcsicmp(a->path, b->path);
++}
++
++static CRITICAL_SECTION cache_cs;
++static CRITICAL_SECTION_DEBUG cache_cs_debug =
++{
++    0, 0, &cache_cs,
++    { &cache_cs_debug.ProcessLocksList, &cache_cs_debug.ProcessLocksList },
++      0, 0, { (DWORD_PTR)(__FILE__ ": cache_cs") }
++};
++static CRITICAL_SECTION cache_cs = { &cache_cs_debug, -1, 0, 0, 0, 0 };
++
++static struct rb_tree cache_tree = { thumbnail_compare, NULL };
++static struct list cache_lru = LIST_INIT(cache_lru);
++static SIZE_T cache_cost, cache_limit;
++static BOOL cache_limit_read;
++
++static void thumbnail_release(struct thumbnail *thumb)
++{
++    if (!thumb || InterlockedDecrement(&thumb->refcount)) return;
++    if (thumb->bitmap) DeleteObject(thumb->bitmap);
++    free((WCHAR *)thumb->key.path);
++    free(thumb);
++}
++
++static struct thumbnail *cache_lookup(const struct thumbnail_key *key)
++{
++    struct thumbnail *thumb = NULL;
++    struct rb_entry *entry;
++
++    EnterCriticalSection(&cache_cs);
++    if ((entry = rb_get(&cache_tree, key)))
++    {
++        thumb = RB_ENTRY_VALUE(entry, struct thumbnail, entry);
++        list_remove(&thumb->lru_entry);
++        list_add_head(&cache_lru, &thumb->lru_entry);
++        InterlockedIncrement(&thumb->refcount);
++    }
++    LeaveCriticalSection(&cache_cs);
++    return thumb;
++}
++
++/* Takes over the caller's reference and returns a referenced thumbnail. */
++static struct thumbnail *cache_insert(struct thumbnail *thumb)
++{
++    struct thumbnail *existing, *victim;
++    struct rb_entry *entry;
++
++    EnterCriticalSection(&cache_cs);
++
++    if (!cache_limit_read)
++    {
++        cache_limit = (SIZE_T)get_setting(L"CacheSize", DEFAULT_CACHE_MB) << 20;
++        cache_limit_read = TRUE;
++    }
++
++    if ((entry = rb_get(&cache_tree, &thumb->key)))
++    {
++        /* decoded concurrently by another view */
++        existing = RB_ENTRY_VALUE(entry, struct thumbnail, entry);
++        InterlockedIncrement(&existing->refcount);
++        LeaveCriticalSection(&cache_cs);
++        thumbnail_release(thumb);
++        return existing;
++    }
++
++    rb_put(&cache_tree, &thumb->key, &thumb->entry);
++    list_add_head(&cache_lru, &thumb->lru_entry);
++    InterlockedIncrement(&thumb->refcount);
++    cache_cost += thumb->cost;
++
++    while (cache_cost > cache_limit && !list_empty(&cache_lru))
++    {
++        victim = LIST_ENTRY(list_tail(&cache_lru), struct thumbnail, lru_entry);
++        list_remove(&victim->lru_entry);
++        rb_remove(&cache_tree, &victim->entry);
++        cache_cost -= victim->cost;
++        thumbnail_release(victim);
++    }
++
++    LeaveCriticalSection(&cache_cs);
++    return thumb;
++}
++
++/* Extensions of all registered WIC decoders, as ";.ext1;.ext2;" in lower case. */
++static WCHAR *image_extensions;
++static INIT_ONCE image_extensions_once = INIT_ONCE_STATIC_INIT;
++
++static BOOL WINAPI init_image_extensions(INIT_ONCE *once, void *param, void **context)
++{
++    IWICImagingFactory *factory = param;
++    IEnumUnknown *enumerator;
++    IWICBitmapCodecInfo *info;
++    SIZE_T len = 1, capacity = 256;
++    WCHAR *list, *exts, *ext, *next;
++    IUnknown *unk;
++    UINT needed;
++    ULONG fetched;
++
++    if (!(list = malloc(capacity * sizeof(WCHAR)))) return TRUE;
++    wcscpy(list, L";");
++
++    if (SUCCEEDED(IWICImagingFactory_CreateComponentEnumerator(factory, WICDecoder,
++            WICComponentEnumerateDefault, &enumerator)))
++    {
++        while (IEnumUnknown_Next(enumerator, 1, &unk, &fetched) == S_OK)
++        {
++            if (SUCCEEDED(IUnknown_QueryInterface(unk, &IID_IWICBitmapCodecInfo, (void **)&info)))
++            {
++                needed = 0;
++                if (SUCCEEDED(IWICBitmapCodecInfo_GetFileExtensions(info, 0, NULL, &needed)) && needed
++                        && (exts = malloc(needed * sizeof(WCHAR))))
++                {
++                    if (SUCCEEDED(IWICBitmapCodecInfo_GetFileExtensions(info, needed, exts, &needed)))
++                    {
++                        CharLowerW(exts);
++                        for (ext = exts; ext && *ext; ext = next)
++                        {
++                            SIZE_T ext_len;
++
++                            if ((next = wcschr(ext, ','))) *next++ = 0;
++                            ext_len = wcslen(ext);
++                            if (*ext != '.' || !ext_len) continue;
++                            if (len + ext_len + 2 > capacity)
++                            {
++                                WCHAR *grown;
++
++                                capacity = (len + ext_len + 2) * 2;
++                                if (!(grown = realloc(list, capacity * sizeof(WCHAR)))) break;
++                                list = grown;
++                            }
++                            wcscpy(list + len, ext);
++                            len += ext_len;
++                            wcscpy(list + len, L";");
++                            len++;
++                        }
++                    }
++                    free(exts);
++                }
++                IWICBitmapCodecInfo_Release(info);
++            }
++            IUnknown_Release(unk);
++        }
++        IEnumUnknown_Release(enumerator);
++    }
++
++    TRACE("decoder extensions %s\n", debugstr_w(list));
++    image_extensions = list;
++    return TRUE;
++}
++
++static BOOL is_image_file(IWICImagingFactory *factory, const WCHAR *path)
++{
++    const WCHAR *ext = PathFindExtensionW(path);
++    WCHAR pattern[34];
++    SIZE_T len = wcslen(ext);
++
++    InitOnceExecuteOnce(&image_extensions_once, init_image_extensions, factory, NULL);
++    if (!image_extensions || len < 2 || len > ARRAY_SIZE(pattern) - 3) return FALSE;
++
++    pattern[0] = ';';
++    wcscpy(pattern + 1, ext);
++    pattern[len + 1] = ';';
++    pattern[len + 2] = 0;
++    CharLowerW(pattern);
++    return wcsstr(image_extensions, pattern) != NULL;
++}
++
++/* Multi-resolution icons store their sizes as frames; use the largest one. */
++static UINT largest_frame(IWICBitmapDecoder *decoder)
++{
++    UINT count = 0, i, width, height, best = 0;
++    ULONGLONG area, best_area = 0;
++    IWICBitmapFrameDecode *frame;
++
++    IWICBitmapDecoder_GetFrameCount(decoder, &count);
++    for (i = 0; i < count; i++)
++    {
++        if (FAILED(IWICBitmapDecoder_GetFrame(decoder, i, &frame))) continue;
++        if (SUCCEEDED(IWICBitmapFrameDecode_GetSize(frame, &width, &height))
++                && (area = (ULONGLONG)width * height) > best_area)
++        {
++            best_area = area;
++            best = i;
++        }
++        IWICBitmapFrameDecode_Release(frame);
++    }
++    return best;
++}
++
++static HRESULT decode_thumbnail(IWICImagingFactory *factory, struct thumbnail *thumb)
++{
++    const WCHAR *path = thumb->key.path;
++    IWICBitmapFrameDecode *frame = NULL;
++    IWICFormatConverter *converter = NULL;
++    IWICBitmapDecoder *decoder = NULL;
++    UINT width, height, disp_w, disp_h, out_w, out_h, dst_w, dst_h, orientation = 1, band_rows, y, i;
++    BYTE *band = NULL, *pixels = NULL, *oriented;
++    struct resampler rs;
++    BOOL have_rs = FALSE;
++    GUID container;
++    double scale;
++    HRESULT hr;
++
++    hr = IWICImagingFactory_CreateDecoderFromFilename(factory, path, NULL, GENERIC_READ,
++            WICDecodeMetadataCacheOnDemand, &decoder);
++    if (FAILED(hr)) return hr;
++
++    if (FAILED(hr = IWICBitmapDecoder_GetContainerFormat(decoder, &container))) goto done;
++    i = IsEqualGUID(&container, &GUID_ContainerFormatIco) ? largest_frame(decoder) : 0;
++    if (FAILED(hr = IWICBitmapDecoder_GetFrame(decoder, i, &frame))) goto done;
++    if (FAILED(hr = IWICBitmapFrameDecode_GetSize(frame, &width, &height))) goto done;
++
++    if (!width || !height || width > MAX_SOURCE_DIMENSION || height > MAX_SOURCE_DIMENSION
++            || (ULONGLONG)width * height > MAX_SOURCE_PIXELS)
++    {
++        WARN("%s: unsupported size %ux%u\n", debugstr_w(path), width, height);
++        hr = WINCODEC_ERR_IMAGESIZEOUTOFRANGE;
++        goto done;
++    }
++
++    if (IsEqualGUID(&container, &GUID_ContainerFormatJpeg) || IsEqualGUID(&container, &GUID_ContainerFormatTiff))
++        orientation = read_orientation(path);
++
++    /* fit the displayed image into the box; small images are not enlarged */
++    disp_w = orientation >= 5 ? height : width;
++    disp_h = orientation >= 5 ? width : height;
++    scale = min(1.0, min((double)thumb->key.box / disp_w, (double)thumb->key.box / disp_h));
++    out_w = max(1, (UINT)(disp_w * scale + 0.5));
++    out_h = max(1, (UINT)(disp_h * scale + 0.5));
++    dst_w = orientation >= 5 ? out_h : out_w;
++    dst_h = orientation >= 5 ? out_w : out_h;
++
++    if (FAILED(hr = IWICImagingFactory_CreateFormatConverter(factory, &converter))) goto done;
++    hr = IWICFormatConverter_Initialize(converter, (IWICBitmapSource *)frame, &GUID_WICPixelFormat32bppPBGRA,
++            WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom);
++    if (FAILED(hr)) goto done;
++
++    band_rows = max(1, min(height, BAND_BYTES / (width * 4)));
++    if (!(band = malloc((SIZE_T)width * 4 * band_rows)) || !(pixels = malloc((SIZE_T)dst_w * dst_h * 4))
++            || !(have_rs = resampler_init(&rs, width, height, dst_w, dst_h, pixels)))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++
++    for (y = 0; y < height; y += band_rows)
++    {
++        WICRect rect = { 0, y, width, min(band_rows, height - y) };
++
++        hr = IWICFormatConverter_CopyPixels(converter, &rect, width * 4, width * 4 * rect.Height, band);
++        if (FAILED(hr)) goto done;
++        for (i = 0; i < (UINT)rect.Height; i++) resampler_push_row(&rs, band + (SIZE_T)i * width * 4);
++    }
++    resampler_finish(&rs);
++
++    if (orientation != 1)
++    {
++        if (!(oriented = apply_orientation(pixels, dst_w, dst_h, orientation, &out_w, &out_h)))
++        {
++            hr = E_OUTOFMEMORY;
++            goto done;
++        }
++        free(pixels);
++        pixels = oriented;
++    }
++
++    if (!(thumb->bitmap = create_dib(out_w, out_h, pixels)))
++    {
++        hr = E_OUTOFMEMORY;
++        goto done;
++    }
++    thumb->width = out_w;
++    thumb->height = out_h;
++    thumb->opaque = rs.opaque;
++    thumb->cost += (SIZE_T)out_w * out_h * 4;
++
++    if (TRACE_ON(thumbnail))
++    {
++        WICPixelFormatGUID format;
++
++        IWICBitmapFrameDecode_GetPixelFormat(frame, &format);
++        TRACE("%s: %ux%u %s orientation %u -> %ux%u%s\n", debugstr_w(path), width, height,
++                debugstr_guid(&format), orientation, out_w, out_h, thumb->opaque ? " opaque" : "");
++    }
++
++done:
++    if (have_rs) resampler_cleanup(&rs);
++    free(band);
++    free(pixels);
++    if (converter) IWICFormatConverter_Release(converter);
++    if (frame) IWICBitmapFrameDecode_Release(frame);
++    IWICBitmapDecoder_Release(decoder);
++    return hr;
++}
++
++static struct thumbnail *get_thumbnail(IWICImagingFactory **factory, const struct thumbnail_key *key)
++{
++    struct thumbnail *thumb;
++    HRESULT hr;
++
++    if ((thumb = cache_lookup(key))) return thumb;
++
++    if (!(thumb = calloc(1, sizeof(*thumb)))) return NULL;
++    thumb->refcount = 1;
++    thumb->key = *key;
++    if (!(thumb->key.path = wcsdup(key->path)))
++    {
++        free(thumb);
++        return NULL;
++    }
++    thumb->cost = sizeof(*thumb) + (wcslen(key->path) + 1) * sizeof(WCHAR);
++
++    if (!*factory && FAILED(hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
++            &IID_IWICImagingFactory, (void **)factory)))
++    {
++        ERR("failed to create WIC imaging factory, hr %#lx\n", hr);
++        *factory = NULL;
++    }
++
++    if (*factory && is_image_file(*factory, key->path) && FAILED(hr = decode_thumbnail(*factory, thumb)))
++        WARN("%s: no thumbnail, hr %#lx\n", debugstr_w(key->path), hr);
++
++    return cache_insert(thumb);
++}
++
++/*
++ * Background workers. A small pool of threads per thumbnail view; requests
++ * are served newest batch first so the items on screen are decoded before
++ * the ones scrolled away. Results are posted to the view's message-only
++ * sink window.
++ */
++struct view_item;
++
++struct thumbnail_request
++{
++    struct list entry;
++    struct view_item *item;
++    struct thumbnail_key key;   /* key.path is owned by the request */
++    struct thumbnail *thumb;
++};
++
++struct thumbnail_worker
++{
++    LONG refcount;
++    CRITICAL_SECTION cs;
++    struct list queue;
++    HANDLE wakeup;      /* manual reset, signaled while the queue is not empty or when cancelled */
++    HWND sink;
++    BOOL cancelled;
++};
++
++static void request_free(struct thumbnail_request *req)
++{
++    thumbnail_release(req->thumb);
++    free((WCHAR *)req->key.path);
++    free(req);
++}
++
++static void worker_release(struct thumbnail_worker *worker)
++{
++    struct thumbnail_request *req, *next;
++
++    if (InterlockedDecrement(&worker->refcount)) return;
++
++    LIST_FOR_EACH_ENTRY_SAFE(req, next, &worker->queue, struct thumbnail_request, entry)
++    {
++        list_remove(&req->entry);
++        request_free(req);
++    }
++    CloseHandle(worker->wakeup);
++    worker->cs.DebugInfo->Spare[0] = 0;
++    DeleteCriticalSection(&worker->cs);
++    free(worker);
++}
++
++static DWORD WINAPI worker_proc(void *arg)
++{
++    struct thumbnail_worker *worker = arg;
++    IWICImagingFactory *factory = NULL;
++    struct thumbnail_request *req;
++    HMODULE module = shell32_hInstance;
++    HRESULT init;
++
++    init = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++
++    for (;;)
++    {
++        EnterCriticalSection(&worker->cs);
++        while (!worker->cancelled && list_empty(&worker->queue))
++        {
++            ResetEvent(worker->wakeup);
++            LeaveCriticalSection(&worker->cs);
++            WaitForSingleObject(worker->wakeup, INFINITE);
++            EnterCriticalSection(&worker->cs);
++        }
++        if (worker->cancelled)
++        {
++            LeaveCriticalSection(&worker->cs);
++            break;
++        }
++        req = LIST_ENTRY(list_head(&worker->queue), struct thumbnail_request, entry);
++        list_remove(&req->entry);
++        LeaveCriticalSection(&worker->cs);
++
++        req->thumb = get_thumbnail(&factory, &req->key);
++
++        EnterCriticalSection(&worker->cs);
++        if (worker->cancelled || !PostMessageW(worker->sink, WM_THUMBNAIL_READY, 0, (LPARAM)req))
++            request_free(req);
++        LeaveCriticalSection(&worker->cs);
++    }
++
++    if (factory) IWICImagingFactory_Release(factory);
++    if (SUCCEEDED(init)) CoUninitialize();
++    worker_release(worker);
++    FreeLibraryAndExitThread(module, 0);
++}
++
++static UINT worker_thread_count(void)
++{
++    SYSTEM_INFO info;
++
++    /* leave most of the CPU to the application; decoding also needs a lot of
++     * address space, which 32-bit processes are short of */
++    GetSystemInfo(&info);
++    return max(1, min(sizeof(void *) == 4 ? 2 : 4, (info.dwNumberOfProcessors + 1) / 2));
++}
++
++static struct thumbnail_worker *worker_create(HWND sink)
++{
++    UINT i, count = worker_thread_count();
++    struct thumbnail_worker *worker;
++    HMODULE module;
++    HANDLE thread;
++
++    if (!(worker = calloc(1, sizeof(*worker)))) return NULL;
++    worker->refcount = 1; /* view */
++    worker->sink = sink;
++    list_init(&worker->queue);
++    InitializeCriticalSectionEx(&worker->cs, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
++    worker->cs.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": thumbnail_worker.cs");
++    if (!(worker->wakeup = CreateEventW(NULL, TRUE, FALSE, NULL)))
++    {
++        worker_release(worker);
++        return NULL;
++    }
++
++    for (i = 0; i < count; i++)
++    {
++        /* each thread keeps shell32 loaded until it exits */
++        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (const WCHAR *)worker_proc, &module))
++            break;
++        InterlockedIncrement(&worker->refcount);
++        if (!(thread = CreateThread(NULL, 0, worker_proc, worker, 0, NULL)))
++        {
++            ERR("failed to create thumbnail thread, error %lu\n", GetLastError());
++            InterlockedDecrement(&worker->refcount);
++            FreeLibrary(module);
++            break;
++        }
++        SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
++        SetThreadDescription(thread, L"wine_shell32_thumbnails");
++        CloseHandle(thread);
++    }
++
++    if (!i)
++    {
++        worker_release(worker);
++        return NULL;
++    }
++    TRACE("started %u of %u threads\n", i, count);
++    return worker;
++}
++
++static void worker_cancel(struct thumbnail_worker *worker)
++{
++    struct thumbnail_request *req, *next;
++
++    EnterCriticalSection(&worker->cs);
++    worker->cancelled = TRUE;
++    LIST_FOR_EACH_ENTRY_SAFE(req, next, &worker->queue, struct thumbnail_request, entry)
++    {
++        list_remove(&req->entry);
++        request_free(req);
++    }
++    LeaveCriticalSection(&worker->cs);
++    SetEvent(worker->wakeup);
++}
++
++/*
++ * Per-view state. Items are keyed by the bytes of their child pidl, which
++ * change when a file is modified or renamed, so stale thumbnails are not
++ * reused across a refresh.
++ */
++enum item_state
++{
++    ITEM_PENDING,
++    ITEM_DONE,
++};
++
++struct view_item
++{
++    struct rb_entry entry;
++    ITEMIDLIST *pidl;
++    LPARAM lparam;      /* list view item data, used to find the item again */
++    int icon;           /* system image list index */
++    enum item_state state;
++    struct thumbnail *thumb;
++};
++
++struct view_icon
++{
++    struct rb_entry entry;
++    int index;
++    HBITMAP bitmap;
++    UINT size;
++};
++
++struct thumbnail_view
++{
++    HWND list;
++    HWND sink;
++    IShellFolder *folder;
++    UINT box;
++    UINT dpi;
++    HIMAGELIST layout;
++    HIMAGELIST prev_normal;
++    DWORD prev_ex_style;
++    struct rb_tree items;
++    struct rb_tree icons;
++    struct list batch;
++    BOOL flush_posted;
++    struct thumbnail_worker *worker;
++};
++
++static int view_item_compare(const void *key, const struct rb_entry *entry)
++{
++    const ITEMIDLIST *a = key, *b = RB_ENTRY_VALUE(entry, const struct view_item, entry)->pidl;
++    UINT size_a = ILGetSize(a), size_b = ILGetSize(b);
++
++    if (size_a != size_b) return size_a < size_b ? -1 : 1;
++    return memcmp(a, b, size_a);
++}
++
++static int view_icon_compare(const void *key, const struct rb_entry *entry)
++{
++    int a = *(const int *)key, b = RB_ENTRY_VALUE(entry, const struct view_icon, entry)->index;
++
++    return a < b ? -1 : a > b;
++}
++
++static void view_item_destroy(struct rb_entry *entry, void *context)
++{
++    struct view_item *item = RB_ENTRY_VALUE(entry, struct view_item, entry);
++
++    thumbnail_release(item->thumb);
++    ILFree(item->pidl);
++    free(item);
++}
++
++static void view_icon_destroy(struct rb_entry *entry, void *context)
++{
++    struct view_icon *icon = RB_ENTRY_VALUE(entry, struct view_icon, entry);
++
++    if (icon->bitmap) DeleteObject(icon->bitmap);
++    free(icon);
++}
++
++/* Queues a thumbnail request for a file item, unless the cache has it. */
++static void view_request_thumbnail(struct thumbnail_view *view, struct view_item *item)
++{
++    SFGAOF attrs = SFGAO_FOLDER | SFGAO_FILESYSTEM;
++    const ITEMIDLIST *pidl = item->pidl;
++    WIN32_FILE_ATTRIBUTE_DATA data;
++    struct thumbnail_request *req;
++    struct thumbnail_key key;
++    STRRET str;
++    WCHAR *path;
++
++    if (FAILED(IShellFolder_GetAttributesOf(view->folder, 1, &pidl, &attrs))
++            || (attrs & SFGAO_FOLDER) || !(attrs & SFGAO_FILESYSTEM))
++        return;
++    if (FAILED(IShellFolder_GetDisplayNameOf(view->folder, pidl, SHGDN_FORPARSING, &str))
++            || FAILED(StrRetToStrW(&str, pidl, &path)))
++        return;
++
++    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &data) || (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
++    {
++        CoTaskMemFree(path);
++        return;
++    }
++
++    key.path = path;
++    key.mtime = ((ULONGLONG)data.ftLastWriteTime.dwHighDateTime << 32) | data.ftLastWriteTime.dwLowDateTime;
++    key.size = ((ULONGLONG)data.nFileSizeHigh << 32) | data.nFileSizeLow;
++    key.box = view->box;
++
++    if ((item->thumb = cache_lookup(&key)) || !(req = calloc(1, sizeof(*req))))
++    {
++        CoTaskMemFree(path);
++        return;
++    }
++
++    req->item = item;
++    req->key = key;
++    req->key.path = wcsdup(path);
++    CoTaskMemFree(path);
++    if (!req->key.path)
++    {
++        free(req);
++        return;
++    }
++
++    TRACE("requesting %s\n", debugstr_w(req->key.path));
++    item->state = ITEM_PENDING;
++    list_add_tail(&view->batch, &req->entry);
++    if (!view->flush_posted)
++        view->flush_posted = PostMessageW(view->sink, WM_THUMBNAIL_FLUSH, 0, 0);
++}
++
++static struct view_item *view_get_item(struct thumbnail_view *view, const ITEMIDLIST *pidl, LPARAM lparam)
++{
++    struct view_item *item;
++    struct rb_entry *entry;
++
++    if ((entry = rb_get(&view->items, pidl)))
++    {
++        item = RB_ENTRY_VALUE(entry, struct view_item, entry);
++        item->lparam = lparam;
++        return item;
++    }
++
++    if (!(item = calloc(1, sizeof(*item)))) return NULL;
++    if (!(item->pidl = ILClone(pidl)))
++    {
++        free(item);
++        return NULL;
++    }
++    item->lparam = lparam;
++    item->state = ITEM_DONE;
++    item->icon = SHMapPIDLToSystemImageListIndex(view->folder, pidl, NULL);
++    rb_put(&view->items, item->pidl, &item->entry);
++
++    view_request_thumbnail(view, item);
++    return item;
++}
++
++static void view_flush(struct thumbnail_view *view)
++{
++    struct thumbnail_request *req, *next;
++
++    view->flush_posted = FALSE;
++    if (list_empty(&view->batch)) return;
++
++    if (!view->worker && !(view->worker = worker_create(view->sink)))
++    {
++        LIST_FOR_EACH_ENTRY_SAFE(req, next, &view->batch, struct thumbnail_request, entry)
++        {
++            req->item->state = ITEM_DONE;
++            list_remove(&req->entry);
++            request_free(req);
++        }
++        return;
++    }
++
++    TRACE("queueing %u requests\n", list_count(&view->batch));
++
++    /* the latest batch is what is on screen now, serve it first */
++    EnterCriticalSection(&view->worker->cs);
++    list_move_head(&view->worker->queue, &view->batch);
++    LeaveCriticalSection(&view->worker->cs);
++    SetEvent(view->worker->wakeup);
++}
++
++static void view_thumbnail_ready(struct thumbnail_view *view, struct thumbnail_request *req)
++{
++    struct view_item *item = req->item;
++    LVFINDINFOW find;
++    int index;
++
++    item->state = ITEM_DONE;
++    item->thumb = req->thumb;
++    req->thumb = NULL;
++    request_free(req);
++
++    if (!item->thumb || !item->thumb->bitmap) return;
++
++    memset(&find, 0, sizeof(find));
++    find.flags = LVFI_PARAM;
++    find.lParam = item->lparam;
++    if ((index = SendMessageW(view->list, LVM_FINDITEMW, -1, (LPARAM)&find)) != -1)
++        SendMessageW(view->list, LVM_REDRAWITEMS, index, index);
++}
++
++static LRESULT CALLBACK sink_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
++{
++    struct thumbnail_view *view = (struct thumbnail_view *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
++
++    switch (msg)
++    {
++    case WM_NCCREATE:
++        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW *)lparam)->lpCreateParams);
++        break;
++    case WM_THUMBNAIL_FLUSH:
++        if (view) view_flush(view);
++        return 0;
++    case WM_THUMBNAIL_READY:
++        if (view) view_thumbnail_ready(view, (struct thumbnail_request *)lparam);
++        else request_free((struct thumbnail_request *)lparam);
++        return 0;
++    }
++    return DefWindowProcW(hwnd, msg, wparam, lparam);
++}
++
++static const WCHAR sink_class[] = L"WineShellThumbnailSink";
++static INIT_ONCE sink_class_once = INIT_ONCE_STATIC_INIT;
++
++static BOOL WINAPI register_sink_class(INIT_ONCE *once, void *param, void **context)
++{
++    WNDCLASSW wc;
++
++    memset(&wc, 0, sizeof(wc));
++    wc.lpfnWndProc = sink_proc;
++    wc.hInstance = shell32_hInstance;
++    wc.lpszClassName = sink_class;
++    RegisterClassW(&wc);
++    return TRUE;
++}
++
++/*
++ * Renders a shell icon at the thumbnail size from the 256px image list.
++ * Drawing it over black and over white recovers premultiplied colour and
++ * alpha whether the icon has an alpha channel or only a mask.
++ */
++static HBITMAP render_icon(UINT box, int index, UINT *size)
++{
++    HBITMAP black_bitmap = NULL, white_bitmap = NULL, bitmap = NULL;
++    BYTE *black, *white, *pixels = NULL, *scaled;
++    BITMAPINFO info;
++    IImageList *list;
++    int cx, cy;
++    UINT i, count;
++    HGDIOBJ old;
++    HDC hdc;
++
++    if (index < 0 || FAILED(SHGetImageList(SHIL_JUMBO, &IID_IImageList, (void **)&list))) return NULL;
++    if (!ImageList_GetIconSize((HIMAGELIST)list, &cx, &cy) || cx <= 0 || cx != cy) goto done;
++
++    memset(&info, 0, sizeof(info));
++    info.bmiHeader.biSize = sizeof(info.bmiHeader);
++    info.bmiHeader.biWidth = cx;
++    info.bmiHeader.biHeight = -cy;
++    info.bmiHeader.biPlanes = 1;
++    info.bmiHeader.biBitCount = 32;
++    info.bmiHeader.biCompression = BI_RGB;
++    count = cx * cy;
++
++    if (!(black_bitmap = CreateDIBSection(NULL, &info, DIB_RGB_COLORS, (void **)&black, NULL, 0))
++            || !(white_bitmap = CreateDIBSection(NULL, &info, DIB_RGB_COLORS, (void **)&white, NULL, 0))
++            || !(pixels = malloc((SIZE_T)count * 4)))
++        goto done;
++    memset(black, 0, (SIZE_T)count * 4);
++    memset(white, 0xff, (SIZE_T)count * 4);
++
++    hdc = CreateCompatibleDC(NULL);
++    old = SelectObject(hdc, black_bitmap);
++    ImageList_Draw((HIMAGELIST)list, index, hdc, 0, 0, ILD_NORMAL);
++    SelectObject(hdc, white_bitmap);
++    ImageList_Draw((HIMAGELIST)list, index, hdc, 0, 0, ILD_NORMAL);
++    SelectObject(hdc, old);
++    DeleteDC(hdc);
++    GdiFlush();
++
++    for (i = 0; i < count * 4; i += 4)
++    {
++        int diff = (white[i] - black[i] + white[i + 1] - black[i + 1] + white[i + 2] - black[i + 2]) / 3;
++        BYTE alpha = 255 - max(0, min(255, diff));
++
++        pixels[i] = min(black[i], alpha);
++        pixels[i + 1] = min(black[i + 1], alpha);
++        pixels[i + 2] = min(black[i + 2], alpha);
++        pixels[i + 3] = alpha;
++    }
++
++    *size = min(box, (UINT)cx);
++    if (*size != (UINT)cx)
++    {
++        if (!(scaled = resample(pixels, cx, cy, *size, *size, NULL))) goto done;
++        free(pixels);
++        pixels = scaled;
++    }
++    bitmap = create_dib(*size, *size, pixels);
++
++done:
++    free(pixels);
++    if (black_bitmap) DeleteObject(black_bitmap);
++    if (white_bitmap) DeleteObject(white_bitmap);
++    IImageList_Release(list);
++    return bitmap;
++}
++
++static struct view_icon *view_get_icon(struct thumbnail_view *view, int index)
++{
++    struct view_icon *icon;
++    struct rb_entry *entry;
++
++    if ((entry = rb_get(&view->icons, &index))) return RB_ENTRY_VALUE(entry, struct view_icon, entry);
++
++    if (!(icon = calloc(1, sizeof(*icon)))) return NULL;
++    icon->index = index;
++    icon->bitmap = render_icon(view->box, index, &icon->size);
++    rb_put(&view->icons, &icon->index, &icon->entry);
++    return icon;
++}
++
++static void draw_bitmap(HDC hdc, HBITMAP bitmap, int x, int y, UINT width, UINT height)
++{
++    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
++    HDC mem = CreateCompatibleDC(hdc);
++    HGDIOBJ old = SelectObject(mem, bitmap);
++
++    GdiAlphaBlend(hdc, x, y, width, height, mem, 0, 0, width, height, blend);
++    SelectObject(mem, old);
++    DeleteDC(mem);
++}
++
++static void frame_rect(HDC hdc, const RECT *rect, COLORREF color, int width)
++{
++    HBRUSH brush = CreateSolidBrush(color);
++    RECT frame = *rect;
++
++    while (width-- > 0 && frame.right > frame.left && frame.bottom > frame.top)
++    {
++        FrameRect(hdc, &frame, brush);
++        InflateRect(&frame, -1, -1);
++    }
++    DeleteObject(brush);
++}
++
++static int scale_for_dpi(const struct thumbnail_view *view, int value)
++{
++    return max(1, MulDiv(value, view->dpi, USER_DEFAULT_SCREEN_DPI));
++}
++
++static COLORREF blend_color(COLORREF fg, COLORREF bg, UINT alpha)
++{
++    return RGB((GetRValue(fg) * alpha + GetRValue(bg) * (255 - alpha)) / 255,
++               (GetGValue(fg) * alpha + GetGValue(bg) * (255 - alpha)) / 255,
++               (GetBValue(fg) * alpha + GetBValue(bg) * (255 - alpha)) / 255);
++}
++
++static BOOL get_item_rect(HWND list, int index, int code, RECT *rect)
++{
++    rect->left = code;
++    return SendMessageW(list, LVM_GETITEMRECT, index, (LPARAM)rect);
++}
++
++/* Selection covers the whole cell above the label, like modern Explorer. */
++static BOOL get_selection_rect(struct thumbnail_view *view, const NMLVCUSTOMDRAW *cd, RECT *rect)
++{
++    int index = cd->nmcd.dwItemSpec;
++    RECT icon, label;
++
++    if (!get_item_rect(view->list, index, LVIR_ICON, &icon) || !get_item_rect(view->list, index, LVIR_LABEL, &label))
++        return FALSE;
++    rect->left = cd->nmcd.rc.left + scale_for_dpi(view, 2);
++    rect->right = cd->nmcd.rc.right - scale_for_dpi(view, 2);
++    rect->top = icon.top - scale_for_dpi(view, 2);
++    rect->bottom = label.bottom;
++    return TRUE;
++}
++
++static void get_selection_colors(struct thumbnail_view *view, COLORREF *fill, COLORREF *border)
++{
++    COLORREF window = GetSysColor(COLOR_WINDOW);
++    COLORREF base = GetFocus() == view->list ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_BTNSHADOW);
++
++    *fill = blend_color(base, window, 56);
++    *border = blend_color(base, window, 150);
++}
++
++static LRESULT item_prepaint(struct thumbnail_view *view, NMLVCUSTOMDRAW *cd)
++{
++    COLORREF fill, border;
++    HBRUSH brush;
++    RECT rect;
++
++    if ((cd->nmcd.uItemState & CDIS_SELECTED) && get_selection_rect(view, cd, &rect))
++    {
++        get_selection_colors(view, &fill, &border);
++        brush = CreateSolidBrush(fill);
++        FillRect(cd->nmcd.hdc, &rect, brush);
++        DeleteObject(brush);
++
++        /* let the list view paint the label on our fill instead of the classic highlight */
++        cd->nmcd.uItemState &= ~CDIS_SELECTED;
++        cd->clrTextBk = fill;
++        cd->clrText = GetSysColor(COLOR_WINDOWTEXT);
++    }
++    return CDRF_NOTIFYPOSTPAINT | CDRF_NEWFONT;
++}
++
++static void item_postpaint(struct thumbnail_view *view, NMLVCUSTOMDRAW *cd)
++{
++    const ITEMIDLIST *pidl = (const ITEMIDLIST *)cd->nmcd.lItemlParam;
++    int index = cd->nmcd.dwItemSpec;
++    struct thumbnail *thumb;
++    struct view_item *item;
++    struct view_icon *icon;
++    COLORREF fill, border;
++    RECT rect, frame;
++
++    if (!pidl || !(item = view_get_item(view, pidl, cd->nmcd.lItemlParam))) return;
++    if (!get_item_rect(view->list, index, LVIR_ICON, &rect)) return;
++
++    thumb = item->thumb;
++    if (thumb && thumb->bitmap)
++    {
++        /* centred horizontally and sitting on the label, like Explorer */
++        frame.left = rect.left + ((int)view->box - (int)thumb->width) / 2;
++        frame.top = rect.top + (int)view->box - (int)thumb->height;
++        draw_bitmap(cd->nmcd.hdc, thumb->bitmap, frame.left, frame.top, thumb->width, thumb->height);
++
++        if (thumb->opaque)
++        {
++            int width = scale_for_dpi(view, 1);
++
++            frame.right = frame.left + thumb->width + width;
++            frame.bottom = frame.top + thumb->height + width;
++            frame.left -= width;
++            frame.top -= width;
++            frame_rect(cd->nmcd.hdc, &frame, blend_color(GetSysColor(COLOR_WINDOWTEXT), GetSysColor(COLOR_WINDOW), 40), width);
++        }
++    }
++    else if ((icon = view_get_icon(view, item->icon)) && icon->bitmap)
++    {
++        draw_bitmap(cd->nmcd.hdc, icon->bitmap, rect.left + ((int)view->box - (int)icon->size) / 2,
++                rect.top + ((int)view->box - (int)icon->size) / 2, icon->size, icon->size);
++    }
++
++    if ((SendMessageW(view->list, LVM_GETITEMSTATE, index, LVIS_SELECTED) & LVIS_SELECTED)
++            && get_selection_rect(view, cd, &rect))
++    {
++        get_selection_colors(view, &fill, &border);
++        frame_rect(cd->nmcd.hdc, &rect, border, scale_for_dpi(view, 1));
++    }
++}
++
++LRESULT thumbnail_view_custom_draw(struct thumbnail_view *view, NMLVCUSTOMDRAW *cd)
++{
++    switch (cd->nmcd.dwDrawStage)
++    {
++    case CDDS_PREPAINT:
++        return CDRF_NOTIFYITEMDRAW;
++    case CDDS_ITEMPREPAINT:
++        return item_prepaint(view, cd);
++    case CDDS_ITEMPOSTPAINT:
++        item_postpaint(view, cd);
++        break;
++    }
++    return CDRF_DODEFAULT;
++}
++
++struct thumbnail_view *thumbnail_view_create(HWND list, IShellFolder *folder)
++{
++    struct thumbnail_view *view;
++    UINT size, dpi;
++
++    if (!(view = calloc(1, sizeof(*view)))) return NULL;
++
++    size = max(MIN_THUMBNAIL_SIZE, min(MAX_THUMBNAIL_SIZE, get_setting(L"Size", DEFAULT_THUMBNAIL_SIZE)));
++    if (!(dpi = GetDpiForWindow(list))) dpi = USER_DEFAULT_SCREEN_DPI;
++    view->box = MulDiv(size, dpi, USER_DEFAULT_SCREEN_DPI);
++    view->dpi = dpi;
++    view->list = list;
++    view->folder = folder;
++    IShellFolder_AddRef(folder);
++    rb_init(&view->items, view_item_compare);
++    rb_init(&view->icons, view_icon_compare);
++    list_init(&view->batch);
++
++    InitOnceExecuteOnce(&sink_class_once, register_sink_class, NULL, NULL);
++    view->sink = CreateWindowExW(0, sink_class, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, shell32_hInstance, view);
++
++    /* an empty image list of thumbnail size makes the list view lay out the cells */
++    view->layout = ImageList_Create(view->box, view->box, ILC_COLOR32, 0, 1);
++    if (!view->sink || !view->layout)
++    {
++        if (view->sink) DestroyWindow(view->sink);
++        if (view->layout) ImageList_Destroy(view->layout);
++        IShellFolder_Release(folder);
++        free(view);
++        return NULL;
++    }
++
++    view->prev_normal = (HIMAGELIST)SendMessageW(list, LVM_SETIMAGELIST, LVSIL_NORMAL, (LPARAM)view->layout);
++    view->prev_ex_style = SendMessageW(list, LVM_GETEXTENDEDLISTVIEWSTYLE, 0, 0);
++    SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_DOUBLEBUFFER, LVS_EX_DOUBLEBUFFER);
++
++    TRACE("list %p, box %u\n", list, view->box);
++    return view;
++}
++
++void thumbnail_view_destroy(struct thumbnail_view *view)
++{
++    struct thumbnail_request *req, *next;
++    MSG msg;
++
++    if (!view) return;
++    TRACE("list %p\n", view->list);
++
++    if (view->worker) worker_cancel(view->worker);
++
++    /* results that were already posted still own a reference */
++    while (PeekMessageW(&msg, view->sink, WM_THUMBNAIL_FLUSH, WM_THUMBNAIL_READY, PM_REMOVE))
++        if (msg.message == WM_THUMBNAIL_READY) request_free((struct thumbnail_request *)msg.lParam);
++    SetWindowLongPtrW(view->sink, GWLP_USERDATA, 0);
++    DestroyWindow(view->sink);
++
++    LIST_FOR_EACH_ENTRY_SAFE(req, next, &view->batch, struct thumbnail_request, entry)
++    {
++        list_remove(&req->entry);
++        request_free(req);
++    }
++    if (view->worker) worker_release(view->worker);
++
++    if (IsWindow(view->list))
++    {
++        SendMessageW(view->list, LVM_SETIMAGELIST, LVSIL_NORMAL, (LPARAM)view->prev_normal);
++        SendMessageW(view->list, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_DOUBLEBUFFER,
++                view->prev_ex_style & LVS_EX_DOUBLEBUFFER);
++    }
++    ImageList_Destroy(view->layout);
++
++    rb_destroy(&view->items, view_item_destroy, NULL);
++    rb_destroy(&view->icons, view_icon_destroy, NULL);
++    IShellFolder_Release(view->folder);
++    free(view);
++}
+diff --git a/dlls/shell32/shlview_thumbs.h b/dlls/shell32/shlview_thumbs.h
+new file mode 100644
+index 00000000..06b7e197
+--- /dev/null
++++ b/dlls/shell32/shlview_thumbs.h
+@@ -0,0 +1,33 @@
++/*
++ * Thumbnail view mode for the shell view
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_SHLVIEW_THUMBS_H
++#define __WINE_SHLVIEW_THUMBS_H
++
++#include "commctrl.h"
++#include "shlobj.h"
++
++struct thumbnail_view;
++
++/* Switches the list view to thumbnail layout; items are drawn through
++ * thumbnail_view_custom_draw() until thumbnail_view_destroy() restores it. */
++struct thumbnail_view *thumbnail_view_create(HWND list, IShellFolder *folder);
++void thumbnail_view_destroy(struct thumbnail_view *view);
++LRESULT thumbnail_view_custom_draw(struct thumbnail_view *view, NMLVCUSTOMDRAW *cd);
++
++#endif /* __WINE_SHLVIEW_THUMBS_H */
+diff --git a/include/shlobj.h b/include/shlobj.h
+index 058148ee..0ad0c88f 100644
+--- a/include/shlobj.h
++++ b/include/shlobj.h
+@@ -338,6 +338,7 @@ typedef struct
+ #define FCIDM_SHVIEW_SMALLICON  0x702A
+ #define FCIDM_SHVIEW_LISTVIEW   0x702B
+ #define FCIDM_SHVIEW_REPORTVIEW 0x702C
++#define FCIDM_SHVIEW_THUMBNAIL  0x702D /* Wine extension */
+ /* 0x7030-0x703f are used by the shellbrowser */
+ #define FCIDM_SHVIEW_AUTOARRANGE 0x7031
+ #define FCIDM_SHVIEW_SNAPTOGRID 0x7032
+@@ -358,6 +359,7 @@ typedef struct
+ #define FCIDM_TB_SMALLICON      0xA003
+ #define FCIDM_TB_REPORTVIEW     0xA004
+ #define FCIDM_TB_DESKTOP        0xA005  /* FIXME */
++#define FCIDM_TB_THUMBNAILVIEW  0xA006  /* Wine extension */
+ 
+ #define FCIDM_BROWSERLAST       0xbf00
+ #define FCIDM_GLOBALFIRST       0x8000

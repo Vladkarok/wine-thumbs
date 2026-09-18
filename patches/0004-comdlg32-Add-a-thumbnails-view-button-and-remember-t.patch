@@ -1,0 +1,283 @@
+From 6deda292ff78c00f08f717eab2dfbb5cf0cc6c1b Mon Sep 17 00:00:00 2001
+From: wine-thumbs <wine-thumbs@localhost>
+Date: Fri, 18 Sep 2026 16:19:26 +0200
+Subject: [PATCH 4/4] comdlg32: Add a thumbnails view button and remember the
+ view mode.
+
+The explorer style dialog gets a Thumbnails toolbar button next to List
+and Details. The view mode picked in either file dialog is stored in
+HKCU\Software\Wine\FileDialog "ViewMode" and used by both dialogs the
+next time they open.
+---
+ dlls/comdlg32/cdlg.h           |   2 +
+ dlls/comdlg32/comdlg32.rc      |   1 +
+ dlls/comdlg32/filedlg.c        | 135 ++++++++++++++++++++++++++++++++-
+ dlls/comdlg32/filedlgbrowser.h |   1 +
+ dlls/comdlg32/itemdlg.c        |  13 +++-
+ 5 files changed, 148 insertions(+), 4 deletions(-)
+
+diff --git a/dlls/comdlg32/cdlg.h b/dlls/comdlg32/cdlg.h
+index 79c951d1..09bbc44e 100644
+--- a/dlls/comdlg32/cdlg.h
++++ b/dlls/comdlg32/cdlg.h
+@@ -178,6 +178,8 @@ int FILEDLG95_ValidatePathAction(LPWSTR lpstrPathAndFile, IShellFolder **ppsf,
+                                  HWND hwnd, DWORD flags, BOOL isSaveDlg, int defAction);
+ int COMDLG32_SplitFileNames(LPWSTR lpstrEdit, UINT nStrLen, LPWSTR *lpstrFileList, UINT *sizeUsed);
+ void FILEDLG95_OnOpenMessage(HWND hwnd, int idCaption, int idText);
++UINT COMDLG32_GetFileDialogViewMode(UINT default_mode);
++void COMDLG32_SetFileDialogViewMode(UINT mode, UINT default_mode);
+ 
+ extern BOOL GetFileName31A( OPENFILENAMEA *lpofn, UINT dlgType );
+ extern BOOL GetFileName31W( OPENFILENAMEW *lpofn, UINT dlgType );
+diff --git a/dlls/comdlg32/comdlg32.rc b/dlls/comdlg32/comdlg32.rc
+index 2071c3ca..03607835 100644
+--- a/dlls/comdlg32/comdlg32.rc
++++ b/dlls/comdlg32/comdlg32.rc
+@@ -47,6 +47,7 @@ STRINGTABLE
+     IDS_LISTVIEW         "List"
+     IDS_REPORTVIEW       "Details"
+     IDS_TODESKTOP        "Browse to Desktop"
++    IDS_THUMBNAILVIEW    "Thumbnails"
+ }
+ 
+ STRINGTABLE
+diff --git a/dlls/comdlg32/filedlg.c b/dlls/comdlg32/filedlg.c
+index c0d3aec6..ea567c7c 100644
+--- a/dlls/comdlg32/filedlg.c
++++ b/dlls/comdlg32/filedlg.c
+@@ -1464,6 +1464,10 @@ INT_PTR CALLBACK FileOpenDlgProc95(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM l
+ 		case FCIDM_TB_REPORTVIEW:
+ 		    stringId = IDS_REPORTVIEW;
+ 		    break;
++		/* Thumbnails option button */
++		case FCIDM_TB_THUMBNAILVIEW:
++		    stringId = IDS_THUMBNAILVIEW;
++		    break;
+ 		/* Desktop button */
+ 		case FCIDM_TB_DESKTOP:
+ 		    stringId = IDS_TODESKTOP;
+@@ -1489,6 +1493,118 @@ static inline BOOL filename_is_edit( const FileOpenDlgInfos *info )
+         (info->ofnInfos->Flags & (OFN_ENABLEHOOK | OFN_ENABLETEMPLATE | OFN_ENABLETEMPLATEHANDLE));
+ }
+ 
++/***********************************************************************
++ *      File dialog view mode, shared by the Explorer and the item dialogs
++ */
++static const WCHAR filedlg_settings_key[] = L"Software\\Wine\\FileDialog";
++
++static BOOL is_remembered_view_mode(DWORD mode)
++{
++    return mode == FVM_ICON || mode == FVM_SMALLICON || mode == FVM_LIST
++            || mode == FVM_DETAILS || mode == FVM_THUMBNAIL;
++}
++
++UINT COMDLG32_GetFileDialogViewMode(UINT default_mode)
++{
++    DWORD mode, size = sizeof(mode);
++
++    if (RegGetValueW(HKEY_CURRENT_USER, filedlg_settings_key, L"ViewMode", RRF_RT_REG_DWORD, NULL, &mode, &size)
++            || !is_remembered_view_mode(mode))
++        return default_mode;
++    return mode;
++}
++
++/* Only a mode the user picked is stored, so the defaults of the two dialogs
++ * don't override each other. */
++void COMDLG32_SetFileDialogViewMode(UINT mode, UINT default_mode)
++{
++    DWORD value = mode;
++
++    if (!is_remembered_view_mode(mode) || COMDLG32_GetFileDialogViewMode(default_mode) == mode) return;
++    RegSetKeyValueW(HKEY_CURRENT_USER, filedlg_settings_key, L"ViewMode", REG_DWORD, &value, sizeof(value));
++}
++
++static void filedlg_set_view_mode(const FileOpenDlgInfos *info, UINT mode)
++{
++    IFolderView *view;
++
++    if (info->Shell.FOIShellView && SUCCEEDED(IShellView_QueryInterface(info->Shell.FOIShellView,
++            &IID_IFolderView, (void **)&view)))
++    {
++        IFolderView_SetCurrentViewMode(view, mode);
++        IFolderView_Release(view);
++    }
++}
++
++/* comctl32 has no thumbnails glyph: a 2x2 grid of little pictures, in the
++ * colours of the stock view glyphs */
++static int filedlg_add_thumbnails_glyph(HIMAGELIST list)
++{
++    static const char tile[7][8] = { "ooooooo", "ossssso", "ossssso", "ossssso", "ogggggo", "ogggggo", "ooooooo" };
++    BYTE mask[16 * 2] = { 0 };
++    BITMAPINFO info;
++    ICONINFO icon_info;
++    HICON icon;
++    DWORD *bits;
++    int x, y, index = -1;
++
++    memset(&info, 0, sizeof(info));
++    info.bmiHeader.biSize = sizeof(info.bmiHeader);
++    info.bmiHeader.biWidth = 16;
++    info.bmiHeader.biHeight = -16;
++    info.bmiHeader.biPlanes = 1;
++    info.bmiHeader.biBitCount = 32;
++    info.bmiHeader.biCompression = BI_RGB;
++
++    memset(&icon_info, 0, sizeof(icon_info));
++    icon_info.fIcon = TRUE;
++    if (!(icon_info.hbmColor = CreateDIBSection(NULL, &info, DIB_RGB_COLORS, (void **)&bits, NULL, 0))) return -1;
++
++    for (y = 0; y < 16; y++)
++    {
++        for (x = 0; x < 16; x++)
++        {
++            char c = (x % 9 < 7 && y % 9 < 7) ? tile[y % 9][x % 9] : 0;
++
++            switch (c)
++            {
++            case 'o': bits[y * 16 + x] = 0xff707070; break;
++            case 's': bits[y * 16 + x] = 0xff8ab4e0; break;
++            case 'g': bits[y * 16 + x] = 0xff7aab4f; break;
++            default:
++                bits[y * 16 + x] = 0;
++                mask[y * 2 + x / 8] |= 0x80 >> (x % 8);
++            }
++        }
++    }
++
++    if ((icon_info.hbmMask = CreateBitmap(16, 16, 1, 1, mask)) && (icon = CreateIconIndirect(&icon_info)))
++    {
++        index = ImageList_AddIcon(list, icon);
++        DestroyIcon(icon);
++    }
++    if (icon_info.hbmMask) DeleteObject(icon_info.hbmMask);
++    DeleteObject(icon_info.hbmColor);
++    return index;
++}
++
++/* The template reserves room for the stock toolbar buttons only; let the
++ * toolbar grow into the free space on its right so the last one is not cut. */
++static void filedlg_fit_toolbar(HWND hwnd, HWND toolbar)
++{
++    int count = SendMessageW(toolbar, TB_BUTTONCOUNT, 0, 0);
++    RECT button, rect, client;
++
++    if (!count || !SendMessageW(toolbar, TB_GETITEMRECT, count - 1, (LPARAM)&button)) return;
++    GetWindowRect(toolbar, &rect);
++    MapWindowPoints(0, hwnd, (POINT *)&rect, 2);
++    GetClientRect(hwnd, &client);
++    if (button.right <= rect.right - rect.left) return;
++
++    SetWindowPos(toolbar, 0, 0, 0, max(rect.right, min(rect.left + button.right, client.right)) - rect.left,
++            rect.bottom - rect.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
++}
++
+ /***********************************************************************
+  *      FILEDLG95_InitControls
+  *
+@@ -1512,6 +1628,7 @@ static LRESULT FILEDLG95_InitControls(HWND hwnd)
+    {0,                 0,                   TBSTATE_ENABLED, BTNS_SEP, {0, 0}, 0, 0 },
+    {VIEW_LIST,         FCIDM_TB_SMALLICON,  TBSTATE_ENABLED, BTNS_BUTTON, {0, 0}, 0, 0 },
+    {VIEW_DETAILS,      FCIDM_TB_REPORTVIEW, TBSTATE_ENABLED, BTNS_BUTTON, {0, 0}, 0, 0 },
++   {VIEW_LARGEICONS,   FCIDM_TB_THUMBNAILVIEW, TBSTATE_ENABLED, BTNS_BUTTON, {0, 0}, 0, 0 },
+   };
+   static const TBADDBITMAP tba = {HINST_COMMCTRL, IDB_VIEW_SMALL_COLOR};
+ 
+@@ -1520,6 +1637,7 @@ static LRESULT FILEDLG95_InitControls(HWND hwnd)
+ 
+   HIMAGELIST toolbarImageList;
+   ITEMIDLIST *desktopPidl;
++  int thumbnails_glyph;
+   SHFILEINFOW fileinfo;
+ 
+   FileOpenDlgInfos *fodInfos = get_filedlg_infoptr(hwnd);
+@@ -1596,9 +1714,14 @@ static LRESULT FILEDLG95_InitControls(HWND hwnd)
+   DestroyIcon(fileinfo.hIcon);
+   CoTaskMemFree(desktopPidl);
+ 
++  thumbnails_glyph = filedlg_add_thumbnails_glyph(toolbarImageList);
++
+   /* Finish Toolbar Construction */
+-  SendMessageW(fodInfos->DlgInfos.hwndTB, TB_ADDBUTTONSW, 9, (LPARAM) tbb);
++  SendMessageW(fodInfos->DlgInfos.hwndTB, TB_ADDBUTTONSW, ARRAY_SIZE(tbb), (LPARAM) tbb);
++  if (thumbnails_glyph >= 0)
++      SendMessageW(fodInfos->DlgInfos.hwndTB, TB_CHANGEBITMAP, FCIDM_TB_THUMBNAILVIEW, thumbnails_glyph);
+   SendMessageW(fodInfos->DlgInfos.hwndTB, TB_AUTOSIZE, 0, 0);
++  filedlg_fit_toolbar(hwnd, fodInfos->DlgInfos.hwndTB);
+ 
+   if (is_places_bar_enabled(fodInfos))
+   {
+@@ -2043,6 +2166,10 @@ static LRESULT FILEDLG95_OnWMCommand(HWND hwnd, WPARAM wParam)
+   case FCIDM_TB_REPORTVIEW:
+     FILEDLG95_SHELL_ExecuteCommand(hwnd,CMDSTR_VIEWDETAILSA);
+     break;
++    /* Thumbnails option button */
++  case FCIDM_TB_THUMBNAILVIEW:
++    filedlg_set_view_mode(fodInfos, FVM_THUMBNAIL);
++    break;
+ 
+   case FCIDM_TB_DESKTOP:
+   {
+@@ -2959,7 +3086,7 @@ static LRESULT FILEDLG95_SHELL_Init(HWND hwnd)
+      fodInfos->ShellInfos.folderSettings.fFlags |= FWF_SINGLESEL;
+   }
+   fodInfos->ShellInfos.folderSettings.fFlags |= FWF_AUTOARRANGE | FWF_ALIGNLEFT;
+-  fodInfos->ShellInfos.folderSettings.ViewMode = FVM_LIST;
++  fodInfos->ShellInfos.folderSettings.ViewMode = COMDLG32_GetFileDialogViewMode(FVM_LIST);
+ 
+   /* Construct the IShellBrowser interface */
+   fodInfos->Shell.FOIShellBrowser = IShellBrowserImpl_Construct(hwnd);
+@@ -3036,6 +3163,10 @@ static void FILEDLG95_SHELL_Clean(HWND hwnd)
+     /* clean Shell interfaces */
+     if (fodInfos->Shell.FOIShellView)
+     {
++      FOLDERSETTINGS settings;
++
++      if (SUCCEEDED(IShellView_GetCurrentInfo(fodInfos->Shell.FOIShellView, &settings)))
++        COMDLG32_SetFileDialogViewMode(settings.ViewMode, FVM_LIST);
+       IShellView_DestroyViewWindow(fodInfos->Shell.FOIShellView);
+       IShellView_Release(fodInfos->Shell.FOIShellView);
+     }
+diff --git a/dlls/comdlg32/filedlgbrowser.h b/dlls/comdlg32/filedlgbrowser.h
+index 57c8911f..ad40853b 100644
+--- a/dlls/comdlg32/filedlgbrowser.h
++++ b/dlls/comdlg32/filedlgbrowser.h
+@@ -116,6 +116,7 @@ typedef struct
+ #define IDS_LISTVIEW                    152
+ #define IDS_REPORTVIEW                  153
+ #define IDS_TODESKTOP                   154
++#define IDS_THUMBNAILVIEW               155
+ 
+ #define IDC_OPENREADONLY                chx1
+ 
+diff --git a/dlls/comdlg32/itemdlg.c b/dlls/comdlg32/itemdlg.c
+index 830d88bb..3692697e 100644
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -1971,8 +1971,8 @@ static HRESULT init_explorerbrowser(FileDialogImpl *This)
+     if(FAILED(hr))
+         ERR("Advise (ExplorerBrowser) failed.\n");
+ 
+-    /* Get previous options? */
+-    fos.ViewMode = fos.fFlags = 0;
++    fos.ViewMode = COMDLG32_GetFileDialogViewMode(0);
++    fos.fFlags = 0;
+     if(!(This->options & FOS_ALLOWMULTISELECT))
+         fos.fFlags |= FWF_SINGLESEL;
+ 
+@@ -2216,6 +2216,15 @@ static LRESULT on_wm_destroy(FileDialogImpl *This)
+ 
+     if(This->peb)
+     {
++        IFolderView *view;
++        UINT mode;
++
++        if (SUCCEEDED(IExplorerBrowser_GetCurrentView(This->peb, &IID_IFolderView, (void **)&view)))
++        {
++            if (SUCCEEDED(IFolderView_GetCurrentViewMode(view, &mode)))
++                COMDLG32_SetFileDialogViewMode(mode, FVM_DETAILS);
++            IFolderView_Release(view);
++        }
+         IExplorerBrowser_Destroy(This->peb);
+         IExplorerBrowser_Release(This->peb);
+         This->peb = NULL;

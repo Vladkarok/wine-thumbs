@@ -1,0 +1,29 @@
+From a55740198fade5492def18188f7256507c310b5f Mon Sep 17 00:00:00 2001
+From: wine-thumbs <wine-thumbs@localhost>
+Date: Fri, 18 Sep 2026 16:19:26 +0200
+Subject: [PATCH 3/4] comdlg32: Send toolbar control messages to the toolbar.
+
+IDC_TOOLBAR has the same control id as IDOK, so SendDlgItemMessage() delivered TB_CHECKBUTTON and TB_ENABLEBUTTON from the shell view to the Open button and the current view was never shown as checked.
+---
+ dlls/comdlg32/filedlgbrowser.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/comdlg32/filedlgbrowser.c b/dlls/comdlg32/filedlgbrowser.c
+index b00951aa..18e13e49 100644
+--- a/dlls/comdlg32/filedlgbrowser.c
++++ b/dlls/comdlg32/filedlgbrowser.c
+@@ -568,8 +568,13 @@ static HRESULT WINAPI IShellBrowserImpl_SendControlMsg(IShellBrowser *iface,
+     switch (id)
+     {
+       case FCW_TOOLBAR:
+-        lres = SendDlgItemMessageA( This->hwndOwner, IDC_TOOLBAR, uMsg, wParam, lParam);
++      {
++        FileOpenDlgInfos *info = get_filedlg_infoptr(This->hwndOwner);
++
++        /* not SendDlgItemMessage(): IDC_TOOLBAR has the same control id as IDOK */
++        lres = info ? SendMessageA(info->DlgInfos.hwndTB, uMsg, wParam, lParam) : 0;
+ 	break;
++      }
+       default:
+         FIXME("ctrl id: %x\n", id);
+         return E_NOTIMPL;

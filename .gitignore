@@ -1,0 +1,14 @@
+/src/
+/build/
+/out/
+/runtime/
+/logs/
+/test/out/
+/test/images-many/
+/test/images-one/
+/test/*.exe
+/test/unit/resample_test
+/test/unit/resample_test.c
+/test/images/
+/test/images-formats/
+/test/images-quality/

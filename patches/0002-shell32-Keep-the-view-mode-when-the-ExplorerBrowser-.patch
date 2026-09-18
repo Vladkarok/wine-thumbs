@@ -1,0 +1,27 @@
+From db10c1aefa9db9bc14420f11f465f5adc8a3a49c Mon Sep 17 00:00:00 2001
+From: wine-thumbs <wine-thumbs@localhost>
+Date: Fri, 18 Sep 2026 16:19:26 +0200
+Subject: [PATCH 2/4] shell32: Keep the view mode when the ExplorerBrowser
+ navigates.
+
+The view settings passed at initialization were reused for every new view, so a view mode picked by the user was lost on each folder change.
+---
+ dlls/shell32/ebrowser.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/dlls/shell32/ebrowser.c b/dlls/shell32/ebrowser.c
+index 8ae09d44..ae66536a 100644
+--- a/dlls/shell32/ebrowser.c
++++ b/dlls/shell32/ebrowser.c
+@@ -356,6 +356,11 @@ static HRESULT create_new_shellview(ExplorerBrowserImpl *This, IShellItem *psi)
+         {
+             if(This->hwnd_sv)
+             {
++                FOLDERSETTINGS fs;
++
++                /* keep the view mode picked by the user when browsing elsewhere */
++                if (SUCCEEDED(IShellView_GetCurrentInfo(This->psv, &fs)))
++                    This->fs.ViewMode = fs.ViewMode;
+                 IShellView_DestroyViewWindow(This->psv);
+                 This->hwnd_sv = NULL;
+             }

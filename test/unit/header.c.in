@@ -1,0 +1,9 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+typedef unsigned char BYTE; typedef unsigned int UINT; typedef int BOOL; typedef size_t SIZE_T;
+#define TRUE 1
+#define FALSE 0
+#define max(a,b) ((a) > (b) ? (a) : (b))
+#define min(a,b) ((a) < (b) ? (a) : (b))
