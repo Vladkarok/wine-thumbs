@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <commctrl.h>
+#include <cderr.h>
 #include <shobjidl.h>
 #include <initguid.h>
 #include <wincodec.h>
@@ -141,6 +142,41 @@ static HWND find_child(HWND parent, const WCHAR *cls)
     return (HWND)data[1];
 }
 
+
+static void dump_menu(HMENU menu, int depth)
+{
+    int i, count = GetMenuItemCount(menu);
+
+    for (i = 0; i < count; i++)
+    {
+        MENUITEMINFOW mii = {sizeof(mii)};
+        WCHAR text[128] = L"";
+        char utf8[256];
+
+        mii.fMask = MIIM_ID | MIIM_SUBMENU | MIIM_FTYPE | MIIM_STATE | MIIM_STRING;
+        mii.dwTypeData = text;
+        mii.cch = ARRAY_SIZE(text);
+        GetMenuItemInfoW(menu, i, TRUE, &mii);
+        WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, sizeof(utf8), NULL, NULL);
+        printf("menu %*s%s id=%#x%s%s\n", depth * 2, "", (mii.fType & MFT_SEPARATOR) ? "----" : utf8, mii.wID,
+               (mii.fState & MFS_CHECKED) ? " [x]" : "", (mii.fType & MFT_RADIOCHECK) ? " (radio)" : "");
+        if (mii.hSubMenu) dump_menu(mii.hSubMenu, depth + 1);
+    }
+}
+
+static HWND find_menu_window(void)
+{
+    HWND hwnd = NULL;
+    int i;
+
+    for (i = 0; i < 30 && !hwnd; i++)
+    {
+        Sleep(100);
+        hwnd = FindWindowW(L"#32768", NULL);
+    }
+    return hwnd;
+}
+
 /* actions: comma separated list of
  *   cmd:<id>      WM_COMMAND to the dialog
  *   viewcmd:<id>  WM_COMMAND to the shell view window
@@ -149,6 +185,14 @@ static HWND find_child(HWND parent, const WCHAR *cls)
  *   select:<n>    focus the list and select item n
  *   key:<vk>      key press in the list
  *   scroll:<n>    scroll the list by n lines
+ *   ctxmenu       open the view background menu, dump it, pick nothing
+ *   menucmd:<id>  run a background menu command the way a click does
+ *   items:<n>     print the first n item labels of the list
+ *   type:<text>   set the file name box
+ *   ok            press Open/Save
+ *   address:<p>   type a path in the item dialog address box and press Enter
+ *   click:<id>    WM_COMMAND to the dialog
+ *   addsel:<n>    add item n to the selection
  *   close         cancel the dialog
  */
 static int repeat = 1;
@@ -260,6 +304,167 @@ static void run_actions(void)
             }
             DestroyMenu(menu);
         }
+        else if (!wcscmp(action, L"ctxmenu"))
+        {
+            HWND view = find_child(dlg, L"SHELLDLL_DefView"), menu_hwnd;
+            RECT rc;
+
+            GetWindowRect(view, &rc);
+            PostMessageW(view, WM_CONTEXTMENU, (WPARAM)view, MAKELPARAM(rc.right - 20, rc.bottom - 20));
+            if ((menu_hwnd = find_menu_window()))
+            {
+                HMENU menu = (HMENU)SendMessageW(menu_hwnd, MN_GETHMENU, 0, 0);
+                UINT pick = param ? wcstoul(param, NULL, 0) : 0;
+
+                dump_menu(menu, 0);
+                if (pick)
+                {
+                    /* walk to the item with the keyboard like a user would */
+                    int path[4], depth = 0, i, j, count;
+                    HMENU cur = menu;
+                    BOOL found = FALSE;
+
+                    for (i = 0; i < GetMenuItemCount(cur) && !found; i++)
+                    {
+                        if (GetMenuItemID(cur, i) == pick) { path[depth++] = i; found = TRUE; break; }
+                        if (GetSubMenu(cur, i))
+                        {
+                            HMENU sub = GetSubMenu(cur, i);
+                            count = GetMenuItemCount(sub);
+                            for (j = 0; j < count; j++)
+                                if (GetMenuItemID(sub, j) == pick) { path[0] = i; path[1] = j; depth = 2; found = TRUE; break; }
+                        }
+                    }
+                    printf("pick %#x: %s\n", pick, found ? "found" : "NOT FOUND");
+                    if (found)
+                    {
+                        HMENU level = menu;
+                        HWND target = menu_hwnd;
+
+                        for (i = 0; i < depth; i++)
+                        {
+                            int k, pos = 0;
+                            /* count selectable items before the target position */
+                            for (k = 0; k < path[i]; k++)
+                            {
+                                UINT st = GetMenuState(level, k, MF_BYPOSITION);
+                                if (!(st & MF_SEPARATOR)) pos++;
+                            }
+                            for (k = 0; k <= pos; k++) { PostMessageW(target, WM_KEYDOWN, VK_DOWN, 0); Sleep(30); }
+                            if (i + 1 < depth)
+                            {
+                                PostMessageW(target, WM_KEYDOWN, VK_RIGHT, 0);
+                                Sleep(300);
+                                level = GetSubMenu(level, path[i]);
+                                target = FindWindowExW(NULL, menu_hwnd, L"#32768", NULL);
+                                if (!target) target = menu_hwnd;
+                            }
+                        }
+                        PostMessageW(target, WM_KEYDOWN, VK_RETURN, 0);
+                    }
+                }
+                if (!pick) PostMessageW(menu_hwnd, WM_KEYDOWN, VK_ESCAPE, 0);
+            }
+            else printf("no context menu\n");
+        }
+        else if (!wcscmp(action, L"menucmd"))
+        {
+            HWND view_hwnd = find_child(dlg, L"SHELLDLL_DefView");
+            IShellBrowser *browser = (IShellBrowser *)SendMessageW(GetParent(view_hwnd), WM_USER + 7, 0, 0);
+            IShellView *view = NULL;
+            IContextMenu *cm = NULL;
+            HMENU menu = CreatePopupMenu();
+            HRESULT hr = E_FAIL;
+
+            if (!browser) browser = (IShellBrowser *)SendMessageW(dlg, WM_USER + 7, 0, 0);
+            if (browser && SUCCEEDED(IShellBrowser_QueryActiveShellView(browser, &view))
+                    && SUCCEEDED(IShellView_GetItemObject(view, SVGIO_BACKGROUND, &IID_IContextMenu, (void **)&cm)))
+            {
+                CMINVOKECOMMANDINFO info = {sizeof(info)};
+                UINT id = wcstoul(param, NULL, 0);
+
+                IContextMenu_QueryContextMenu(cm, menu, 0, 0, 0x7fff, 0);
+                info.hwnd = GetParent(view_hwnd);
+                info.lpVerb = MAKEINTRESOURCEA(id);
+                hr = IContextMenu_InvokeCommand(cm, &info);
+            }
+            printf("menucmd %ls -> %#lx\n", param, hr);
+            if (cm) IContextMenu_Release(cm);
+            if (view) IShellView_Release(view);
+            DestroyMenu(menu);
+        }
+        else if (!wcscmp(action, L"items") && list)
+        {
+            int n = wcstoul(param, NULL, 0), k;
+            WCHAR text[260];
+            char utf8[520];
+
+            for (k = 0; k < n; k++)
+            {
+                LVITEMW item = {0};
+
+                item.iSubItem = 0;
+                item.pszText = text;
+                item.cchTextMax = ARRAY_SIZE(text);
+                text[0] = 0;
+                if (!SendMessageW(list, LVM_GETITEMTEXTW, k, (LPARAM)&item)) break;
+                WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, sizeof(utf8), NULL, NULL);
+                printf("item %d: %s\n", k, utf8);
+            }
+        }
+        else if (!wcscmp(action, L"type"))
+        {
+            if (!SetDlgItemTextW(dlg, 0x480 /* edt1 */, param)) SetDlgItemTextW(dlg, 0x47c /* cmb13 */, param);
+        }
+        else if (!wcscmp(action, L"address"))
+        {
+            HWND edit = GetDlgItem(dlg, 204 /* IDC_NAVADDRESS */);
+
+            SetWindowTextW(edit, param);
+            SendMessageW(dlg, WM_NEXTDLGCTL, (WPARAM)edit, TRUE);
+            Sleep(100);
+            PostMessageW(dlg, WM_COMMAND, IDOK, 0);
+        }
+        else if (!wcscmp(action, L"tbmenu"))
+        {
+            /* tbmenu:<toolbar control id>:<button command id>; click it, dump the popup */
+            WCHAR *cmd = wcschr(param, ':');
+            HWND tb = GetDlgItem(dlg, wcstoul(param, NULL, 0)), menu_hwnd;
+            RECT rc;
+
+            if (tb && cmd && SendMessageW(tb, TB_GETRECT, wcstoul(cmd + 1, NULL, 0), (LPARAM)&rc))
+            {
+                LPARAM pos = MAKELPARAM((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
+
+                PostMessageW(tb, WM_LBUTTONDOWN, MK_LBUTTON, pos);
+                PostMessageW(tb, WM_LBUTTONUP, 0, pos);
+                if ((menu_hwnd = find_menu_window()))
+                {
+                    dump_menu((HMENU)SendMessageW(menu_hwnd, MN_GETHMENU, 0, 0), 0);
+                    PostMessageW(menu_hwnd, WM_KEYDOWN, VK_ESCAPE, 0);
+                }
+                else printf("no popup\n");
+            }
+            else printf("no toolbar button\n");
+        }
+        else if (!wcscmp(action, L"resize"))
+        {
+            WCHAR *h = wcschr(param, 'x');
+
+            SetWindowPos(dlg, NULL, 0, 0, wcstoul(param, NULL, 0), h ? wcstoul(h + 1, NULL, 0) : 600,
+                         SWP_NOMOVE | SWP_NOZORDER);
+        }
+        else if (!wcscmp(action, L"click"))
+            PostMessageW(dlg, WM_COMMAND, wcstoul(param, NULL, 0), 0);
+        else if (!wcscmp(action, L"ok"))
+            PostMessageW(dlg, WM_COMMAND, IDOK, 0);
+        else if (!wcscmp(action, L"addsel") && list)
+        {
+            LVITEMW item = {0};
+
+            item.stateMask = item.state = LVIS_SELECTED;
+            SendMessageW(list, LVM_SETITEMSTATE, wcstoul(param, NULL, 0), (LPARAM)&item);
+        }
         else if (!wcscmp(action, L"close"))
             PostMessageW(dlg, WM_COMMAND, IDCANCEL, 0);
         else
@@ -271,18 +476,86 @@ static void run_actions(void)
     (void)prev;
 }
 
+static struct
+{
+    BOOL save, ansi;
+    DWORD flags;
+    const WCHAR *defext, *file;
+    DWORD maxfile;
+} ofn_opts = { FALSE, FALSE, OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST, NULL, NULL, MAX_PATH };
+
+static void print_utf8(const char *label, const WCHAR *text)
+{
+    char utf8[1024];
+
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, sizeof(utf8), NULL, NULL);
+    printf("%s%s\n", label, utf8);
+}
+
 static void run_getopenfilename(const WCHAR *dir)
 {
-    WCHAR file[MAX_PATH] = L"";
+    static const WCHAR filter[] = L"Image Files\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All Files\0*.*\0";
+    WCHAR *file = calloc(ofn_opts.maxfile + 2, sizeof(WCHAR)), title[MAX_PATH] = L"", cwd[MAX_PATH];
     OPENFILENAMEW ofn = {sizeof(ofn)};
+    const WCHAR *p;
+    BOOL ret;
 
-    ofn.lpstrFilter = L"Image Files\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All Files\0*.*\0";
+    if (ofn_opts.file) lstrcpynW(file, ofn_opts.file, ofn_opts.maxfile);
+    ofn.lpstrFilter = filter;
     ofn.lpstrFile = file;
-    ofn.nMaxFile = ARRAY_SIZE(file);
+    ofn.nMaxFile = ofn_opts.maxfile;
+    ofn.lpstrFileTitle = title;
+    ofn.nMaxFileTitle = ARRAY_SIZE(title);
     ofn.lpstrInitialDir = dir;
-    ofn.lpstrTitle = L"Select a Picture";
-    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    printf("GetOpenFileNameW -> %d\n", GetOpenFileNameW(&ofn));
+    ofn.lpstrTitle = ofn_opts.save ? NULL : L"Select a Picture";
+    ofn.lpstrDefExt = ofn_opts.defext;
+    ofn.Flags = ofn_opts.flags;
+
+    if (ofn_opts.ansi)
+    {
+        OPENFILENAMEA ofna = {sizeof(ofna)};
+        char *filea = calloc(ofn_opts.maxfile + 2, 1), titlea[MAX_PATH] = "", dira[MAX_PATH], defexta[16];
+        static const char filtera[] = "Image Files\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All Files\0*.*\0";
+
+        WideCharToMultiByte(CP_ACP, 0, dir, -1, dira, sizeof(dira), NULL, NULL);
+        ofna.lpstrFilter = filtera;
+        ofna.lpstrFile = filea;
+        ofna.nMaxFile = ofn_opts.maxfile;
+        ofna.lpstrFileTitle = titlea;
+        ofna.nMaxFileTitle = sizeof(titlea);
+        ofna.lpstrInitialDir = dira;
+        if (ofn_opts.defext)
+        {
+            WideCharToMultiByte(CP_ACP, 0, ofn_opts.defext, -1, defexta, sizeof(defexta), NULL, NULL);
+            ofna.lpstrDefExt = defexta;
+        }
+        ofna.Flags = ofn_opts.flags;
+        ret = ofn_opts.save ? GetSaveFileNameA(&ofna) : GetOpenFileNameA(&ofna);
+        printf("GetXxxFileNameA -> %d, error %#lx, offset %u, ext %u, filter %lu, flags %#lx\n", ret,
+               CommDlgExtendedError(), ofna.nFileOffset, ofna.nFileExtension, ofna.nFilterIndex, ofna.Flags);
+        if (ret)
+        {
+            const char *q;
+            for (q = filea; *q; q += strlen(q) + 1) printf("  file: %s\n", q);
+            printf("  title: %s\n", titlea);
+        }
+        free(filea);
+        return;
+    }
+
+    ret = ofn_opts.save ? GetSaveFileNameW(&ofn) : GetOpenFileNameW(&ofn);
+    printf("GetXxxFileNameW -> %d, error %#lx, offset %u, ext %u, filter %lu, flags %#lx\n", ret,
+           CommDlgExtendedError(), ofn.nFileOffset, ofn.nFileExtension, ofn.nFilterIndex, ofn.Flags);
+    if (ret)
+    {
+        for (p = file; *p; p += lstrlenW(p) + 1) print_utf8("  file: ", p);
+        print_utf8("  title: ", title);
+    }
+    else if (CommDlgExtendedError() == FNERR_BUFFERTOOSMALL)
+        printf("  needed %u\n", *(WORD *)file);
+    GetCurrentDirectoryW(ARRAY_SIZE(cwd), cwd);
+    print_utf8("  cwd: ", cwd);
+    free(file);
 }
 
 static void run_itemdlg(const WCHAR *dir)
@@ -314,12 +587,21 @@ int wmain(int argc, WCHAR **argv)
     BOOL itemdlg = FALSE;
     int arg = 1, i;
 
-    for (;;)
+    for (; argc > arg && !wcsncmp(argv[arg], L"--", 2); arg++)
     {
-        if (argc > arg && !wcscmp(argv[arg], L"--itemdlg")) itemdlg = TRUE;
-        else if (argc > arg && !wcscmp(argv[arg], L"--dpiaware")) SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
-        else break;
-        arg++;
+        const WCHAR *opt = argv[arg] + 2, *val = wcschr(opt, '=');
+
+        if (val) val++;
+        if (!wcscmp(opt, L"itemdlg")) itemdlg = TRUE;
+        else if (!wcscmp(opt, L"dpiaware")) SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
+        else if (!wcscmp(opt, L"save")) ofn_opts.save = TRUE;
+        else if (!wcscmp(opt, L"ansi")) ofn_opts.ansi = TRUE;
+        else if (!wcscmp(opt, L"multi")) ofn_opts.flags |= OFN_ALLOWMULTISELECT;
+        else if (!wcsncmp(opt, L"flags=", 6)) ofn_opts.flags = wcstoul(val, NULL, 0);
+        else if (!wcsncmp(opt, L"defext=", 7)) ofn_opts.defext = val;
+        else if (!wcsncmp(opt, L"file=", 5)) ofn_opts.file = val;
+        else if (!wcsncmp(opt, L"maxfile=", 8)) ofn_opts.maxfile = wcstoul(val, NULL, 0);
+        else printf("unknown option %ls\n", argv[arg]);
     }
     if (argc - arg < 3)
     {

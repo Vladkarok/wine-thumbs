@@ -1,7 +1,7 @@
-From 6deda292ff78c00f08f717eab2dfbb5cf0cc6c1b Mon Sep 17 00:00:00 2001
+From 6b340dbdaa956b825ebece280afbfbaa0dd592de Mon Sep 17 00:00:00 2001
 From: wine-thumbs <wine-thumbs@localhost>
 Date: Fri, 18 Sep 2026 16:19:26 +0200
-Subject: [PATCH 4/4] comdlg32: Add a thumbnails view button and remember the
+Subject: [PATCH 4/7] comdlg32: Add a thumbnails view button and remember the
  view mode.
 
 The explorer style dialog gets a Thumbnails toolbar button next to List

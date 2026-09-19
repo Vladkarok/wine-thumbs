@@ -31,13 +31,4 @@ if [ ! -f "$dest/.wine-thumbs" ]; then
     echo "wine-thumbs: installed $dest"
 fi
 
-for dir in "$PATCHED_DIR"/*/; do
-    dir=${dir%/}
-    [ "$dir" = "$dest" ] && continue
-    if dir_in_use "$dir"; then
-        echo "wine-thumbs: keeping $dir, still in use"
-    else
-        rm -rf "$dir"
-        echo "wine-thumbs: removed $dir"
-    fi
-done
+prune_patched_dirs "$dest"

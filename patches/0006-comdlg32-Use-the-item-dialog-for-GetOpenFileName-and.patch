@@ -1,0 +1,763 @@
+From 8c68f30431dd26247ef753e645286644183f9b8c Mon Sep 17 00:00:00 2001
+From: wine-thumbs <wine-thumbs@localhost>
+Date: Fri, 18 Sep 2026 20:56:45 +0200
+Subject: [PATCH 6/7] comdlg32: Use the item dialog for GetOpenFileName and
+ GetSaveFileName.
+
+Like Windows since Vista, calls without a hook, a template or a help
+button get the item dialog; the OPENFILENAME fields are mapped to it and
+the result is written back as the Explorer style dialog does, including
+multiple selection, OFN_READONLY through the Open drop-down, the ANSI
+variants and FNERR_BUFFERTOOSMALL. HKCU\Software\Wine\FileDialog
+"Classic"=1, also per application under AppDefaults, keeps the old one.
+
+Both dialogs also follow Windows 7 in opening the folder used last when
+an application passes the lpstrInitialDir it passed the first time.
+---
+ dlls/comdlg32/Makefile.in      |   1 +
+ dlls/comdlg32/cdlg.h           |   4 +
+ dlls/comdlg32/comdlg32.rc      |   3 +
+ dlls/comdlg32/filedlg.c        | 103 +++++--
+ dlls/comdlg32/filedlg_item.c   | 488 +++++++++++++++++++++++++++++++++
+ dlls/comdlg32/filedlgbrowser.h |   5 +
+ 6 files changed, 581 insertions(+), 23 deletions(-)
+ create mode 100644 dlls/comdlg32/filedlg_item.c
+
+diff --git a/dlls/comdlg32/Makefile.in b/dlls/comdlg32/Makefile.in
+index c298c080..9185c33b 100644
+--- a/dlls/comdlg32/Makefile.in
++++ b/dlls/comdlg32/Makefile.in
+@@ -11,6 +11,7 @@ SOURCES = \
+ 	comdlg32_classes.idl \
+ 	filedlg.c \
+ 	filedlg31.c \
++	filedlg_item.c \
+ 	filedlgbrowser.c \
+ 	finddlg.c \
+ 	fontdlg.c \
+diff --git a/dlls/comdlg32/cdlg.h b/dlls/comdlg32/cdlg.h
+index 09bbc44e..88405eaf 100644
+--- a/dlls/comdlg32/cdlg.h
++++ b/dlls/comdlg32/cdlg.h
+@@ -180,6 +180,10 @@ int COMDLG32_SplitFileNames(LPWSTR lpstrEdit, UINT nStrLen, LPWSTR *lpstrFileLis
+ void FILEDLG95_OnOpenMessage(HWND hwnd, int idCaption, int idText);
+ UINT COMDLG32_GetFileDialogViewMode(UINT default_mode);
+ void COMDLG32_SetFileDialogViewMode(UINT mode, UINT default_mode);
++BOOL COMDLG32_GetLastFolder(WCHAR *folder);
++void COMDLG32_SaveLastFolder(const WCHAR *file);
++BOOL COMDLG32_UseLastFolder(const WCHAR *initdir, WCHAR *folder);
++int COMDLG32_AddThumbnailsGlyph(HIMAGELIST list);
+ 
+ extern BOOL GetFileName31A( OPENFILENAMEA *lpofn, UINT dlgType );
+ extern BOOL GetFileName31W( OPENFILENAMEW *lpofn, UINT dlgType );
+diff --git a/dlls/comdlg32/comdlg32.rc b/dlls/comdlg32/comdlg32.rc
+index 03607835..4b6a6a6b 100644
+--- a/dlls/comdlg32/comdlg32.rc
++++ b/dlls/comdlg32/comdlg32.rc
+@@ -48,6 +48,9 @@ STRINGTABLE
+     IDS_REPORTVIEW       "Details"
+     IDS_TODESKTOP        "Browse to Desktop"
+     IDS_THUMBNAILVIEW    "Thumbnails"
++    IDS_OPEN_BUTTON      "&Open"
++    IDS_OPEN_READONLY    "Open as &read-only"
++    IDS_VIEW_MENU        "&View"
+ }
+ 
+ STRINGTABLE
+diff --git a/dlls/comdlg32/filedlg.c b/dlls/comdlg32/filedlg.c
+index ea567c7c..a9961aab 100644
+--- a/dlls/comdlg32/filedlg.c
++++ b/dlls/comdlg32/filedlg.c
+@@ -548,11 +548,13 @@ static BOOL GetFileDialog95(FileOpenDlgInfos *info, UINT dlg_type)
+     switch (dlg_type)
+     {
+     case OPEN_DIALOG:
+-        ret = GetFileName95(info);
++        if (!FILEDLG95_ShowItemDialog(info, FALSE, &ret))
++            ret = GetFileName95(info);
+         break;
+     case SAVE_DIALOG:
+         info->DlgInfos.dwDlgProp |= FODPROP_SAVEDLG;
+-        ret = GetFileName95(info);
++        if (!FILEDLG95_ShowItemDialog(info, TRUE, &ret))
++            ret = GetFileName95(info);
+         break;
+     default:
+         ret = FALSE;
+@@ -1537,54 +1539,65 @@ static void filedlg_set_view_mode(const FileOpenDlgInfos *info, UINT mode)
+ }
+ 
+ /* comctl32 has no thumbnails glyph: a 2x2 grid of little pictures, in the
+- * colours of the stock view glyphs */
+-static int filedlg_add_thumbnails_glyph(HIMAGELIST list)
++ * colours of the stock view glyphs, at the size of the toolbar images */
++int COMDLG32_AddThumbnailsGlyph(HIMAGELIST list)
+ {
+-    static const char tile[7][8] = { "ooooooo", "ossssso", "ossssso", "ossssso", "ogggggo", "ogggggo", "ooooooo" };
+-    BYTE mask[16 * 2] = { 0 };
+-    BITMAPINFO info;
++    int size, height, tile, sky, x, y, tx, ty, stride, index = -1;
+     ICONINFO icon_info;
++    BITMAPINFO info;
++    BYTE *mask;
+     HICON icon;
+     DWORD *bits;
+-    int x, y, index = -1;
++
++    if (!ImageList_GetIconSize(list, &size, &height) || size < 8 || size != height) return -1;
++    tile = (size - 2) / 2;
++    sky = ((tile - 2) * 3 + 4) / 5;
++    stride = (size + 15) / 16 * 2;
++    if (!(mask = calloc(stride, size))) return -1;
+ 
+     memset(&info, 0, sizeof(info));
+     info.bmiHeader.biSize = sizeof(info.bmiHeader);
+-    info.bmiHeader.biWidth = 16;
+-    info.bmiHeader.biHeight = -16;
++    info.bmiHeader.biWidth = size;
++    info.bmiHeader.biHeight = -size;
+     info.bmiHeader.biPlanes = 1;
+     info.bmiHeader.biBitCount = 32;
+     info.bmiHeader.biCompression = BI_RGB;
+ 
+     memset(&icon_info, 0, sizeof(icon_info));
+     icon_info.fIcon = TRUE;
+-    if (!(icon_info.hbmColor = CreateDIBSection(NULL, &info, DIB_RGB_COLORS, (void **)&bits, NULL, 0))) return -1;
++    if (!(icon_info.hbmColor = CreateDIBSection(NULL, &info, DIB_RGB_COLORS, (void **)&bits, NULL, 0)))
++    {
++        free(mask);
++        return -1;
++    }
+ 
+-    for (y = 0; y < 16; y++)
++    for (y = 0; y < size; y++)
+     {
+-        for (x = 0; x < 16; x++)
++        for (x = 0; x < size; x++)
+         {
+-            char c = (x % 9 < 7 && y % 9 < 7) ? tile[y % 9][x % 9] : 0;
++            DWORD *pixel = &bits[y * size + x];
+ 
+-            switch (c)
++            tx = x < tile ? x : x - (size - tile);
++            ty = y < tile ? y : y - (size - tile);
++            if (tx < 0 || ty < 0)
+             {
+-            case 'o': bits[y * 16 + x] = 0xff707070; break;
+-            case 's': bits[y * 16 + x] = 0xff8ab4e0; break;
+-            case 'g': bits[y * 16 + x] = 0xff7aab4f; break;
+-            default:
+-                bits[y * 16 + x] = 0;
+-                mask[y * 2 + x / 8] |= 0x80 >> (x % 8);
++                *pixel = 0;
++                mask[y * stride + x / 8] |= 0x80 >> (x % 8);
+             }
++            else if (!tx || !ty || tx == tile - 1 || ty == tile - 1) *pixel = 0xff707070;
++            else if (ty - 1 < sky) *pixel = 0xff8ab4e0;
++            else *pixel = 0xff7aab4f;
+         }
+     }
+ 
+-    if ((icon_info.hbmMask = CreateBitmap(16, 16, 1, 1, mask)) && (icon = CreateIconIndirect(&icon_info)))
++    if ((icon_info.hbmMask = CreateBitmap(size, size, 1, 1, mask)) && (icon = CreateIconIndirect(&icon_info)))
+     {
+         index = ImageList_AddIcon(list, icon);
+         DestroyIcon(icon);
+     }
+     if (icon_info.hbmMask) DeleteObject(icon_info.hbmMask);
+     DeleteObject(icon_info.hbmColor);
++    free(mask);
+     return index;
+ }
+ 
+@@ -1615,6 +1628,7 @@ static LRESULT FILEDLG95_InitControls(HWND hwnd)
+   BOOL win2000plus = FALSE;
+   BOOL win98plus   = FALSE;
+   BOOL handledPath = FALSE;
++  WCHAR last_folder[MAX_PATH];
+   OSVERSIONINFOW osVi;
+ 
+   static const TBBUTTON tbb[] =
+@@ -1714,7 +1728,7 @@ static LRESULT FILEDLG95_InitControls(HWND hwnd)
+   DestroyIcon(fileinfo.hIcon);
+   CoTaskMemFree(desktopPidl);
+ 
+-  thumbnails_glyph = filedlg_add_thumbnails_glyph(toolbarImageList);
++  thumbnails_glyph = COMDLG32_AddThumbnailsGlyph(toolbarImageList);
+ 
+   /* Finish Toolbar Construction */
+   SendMessageW(fodInfos->DlgInfos.hwndTB, TB_ADDBUTTONSW, ARRAY_SIZE(tbb), (LPARAM) tbb);
+@@ -1815,6 +1829,15 @@ static LRESULT FILEDLG95_InitControls(HWND hwnd)
+       }
+   }
+ 
++  /* 2a. Win7+: the folder used last, if initdir is the one passed the first time */
++  if (!handledPath && win2000plus && COMDLG32_UseLastFolder(fodInfos->initdir, last_folder))
++  {
++      free(fodInfos->initdir);
++      fodInfos->initdir = wcsdup(last_folder);
++      handledPath = TRUE;
++      TRACE("Using the folder used last instead of InitDir: %s\n", debugstr_w(last_folder));
++  }
++
+   /* 2. (All platforms) If initdir is not null, then use it */
+   if (!handledPath && fodInfos->initdir && *fodInfos->initdir)
+   {
+@@ -2558,6 +2581,40 @@ static void FILEDLG95_MRU_load_filename(LPWSTR stored_path)
+     TRACE("got MRU path: %s\n", wine_dbgstr_w(stored_path));
+ }
+ 
++/* the folder this application picked a file in last, if it still exists */
++BOOL COMDLG32_GetLastFolder(WCHAR *folder)
++{
++    folder[0] = 0;
++    FILEDLG95_MRU_load_filename(folder);
++    return folder[0] && PathIsDirectoryW(folder);
++}
++
++void COMDLG32_SaveLastFolder(const WCHAR *file)
++{
++    FILEDLG95_MRU_save_filename(file);
++}
++
++/* Windows 7 and later open the folder used last instead of lpstrInitialDir
++ * when an application passes the lpstrInitialDir it passed the first time,
++ * so a fixed initial folder does not make the user browse every time. */
++BOOL COMDLG32_UseLastFolder(const WCHAR *initdir, WCHAR *folder)
++{
++    static const WCHAR key[] = L"Software\\Wine\\FileDialog\\FirstFolder";
++    WCHAR module_path[MAX_PATH], first[MAX_PATH], *module_name;
++    DWORD size = sizeof(first);
++
++    if (!initdir || !*initdir || !GetModuleFileNameW(NULL, module_path, ARRAY_SIZE(module_path)))
++        return FALSE;
++    module_name = (module_name = wcsrchr(module_path, '\\')) ? module_name + 1 : module_path;
++
++    if (RegGetValueW(HKEY_CURRENT_USER, key, module_name, RRF_RT_REG_SZ, NULL, first, &size))
++    {
++        RegSetKeyValueW(HKEY_CURRENT_USER, key, module_name, REG_SZ, initdir, (lstrlenW(initdir) + 1) * sizeof(WCHAR));
++        return FALSE;
++    }
++    return !lstrcmpiW(first, initdir) && COMDLG32_GetLastFolder(folder);
++}
++
+ void FILEDLG95_OnOpenMessage(HWND hwnd, int idCaption, int idText)
+ {
+   WCHAR strMsgTitle[MAX_PATH];
+diff --git a/dlls/comdlg32/filedlg_item.c b/dlls/comdlg32/filedlg_item.c
+new file mode 100644
+index 00000000..cbd94feb
+--- /dev/null
++++ b/dlls/comdlg32/filedlg_item.c
+@@ -0,0 +1,488 @@
++/*
++ * GetOpenFileName and GetSaveFileName through the item dialog
++ *
++ * Like Windows since Vista, calls that do not customize the dialog with a
++ * hook or a template get the item (IFileDialog) dialog instead of the
++ * Explorer style one. The OPENFILENAME fields are mapped to the dialog and
++ * the result is written back the way the Explorer style dialog does it.
++ * HKCU\Software\Wine\FileDialog "Classic"=1 (also per application under
++ * AppDefaults\<exe>\FileDialog) keeps the old dialog.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++
++#define COBJMACROS
++
++#include "windef.h"
++#include "winbase.h"
++#include "wingdi.h"
++#include "winreg.h"
++#include "winuser.h"
++#include "commdlg.h"
++#include "cderr.h"
++#include "shlobj.h"
++#include "shobjidl.h"
++#include "shlwapi.h"
++#include "wine/debug.h"
++
++#include "cdlg.h"
++#include "filedlgbrowser.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(commdlg);
++
++#define IDC_OPEN_DROPDOWN   1
++#define OPEN_ITEM_NORMAL    0
++#define OPEN_ITEM_READONLY  1
++
++static BOOL get_dword_setting(HKEY root, const WCHAR *path, const WCHAR *name, DWORD *value)
++{
++    DWORD size = sizeof(*value);
++
++    return !RegGetValueW(root, path, name, RRF_RT_REG_DWORD, NULL, value, &size);
++}
++
++static BOOL classic_dialog_wanted(void)
++{
++    WCHAR module[MAX_PATH], path[MAX_PATH + 64];
++    const WCHAR *name;
++    DWORD value;
++
++    if (GetModuleFileNameW(NULL, module, ARRAY_SIZE(module)))
++    {
++        name = (name = wcsrchr(module, '\\')) ? name + 1 : module;
++        swprintf(path, ARRAY_SIZE(path), L"Software\\Wine\\AppDefaults\\%s\\FileDialog", name);
++        if (get_dword_setting(HKEY_CURRENT_USER, path, L"Classic", &value)) return !!value;
++    }
++    return get_dword_setting(HKEY_CURRENT_USER, L"Software\\Wine\\FileDialog", L"Classic", &value) && value;
++}
++
++static BOOL use_item_dialog(const FileOpenDlgInfos *info)
++{
++    /* the item dialog has no way to host these */
++    if (info->ofnInfos->Flags & (OFN_ENABLEHOOK | OFN_ENABLETEMPLATE | OFN_ENABLETEMPLATEHANDLE | OFN_SHOWHELP))
++        return FALSE;
++    return !classic_dialog_wanted();
++}
++
++/* whether the current directory has files matching the filter */
++static BOOL current_dir_has_files(const WCHAR *filter)
++{
++    WIN32_FIND_DATAW data;
++    WCHAR spec[MAX_PATH], *next;
++    HANDLE find;
++
++    for (; filter && *filter; filter += lstrlenW(filter) + 1)
++    {
++        filter += lstrlenW(filter) + 1; /* skip the description */
++        if (!*filter) break;
++        lstrcpynW(spec, filter, ARRAY_SIZE(spec));
++        for (next = spec; next; )
++        {
++            WCHAR *pattern = next;
++
++            if ((next = wcschr(pattern, ';'))) *next++ = 0;
++            if ((find = FindFirstFileW(pattern, &data)) != INVALID_HANDLE_VALUE)
++            {
++                FindClose(find);
++                return TRUE;
++            }
++        }
++    }
++    return FALSE;
++}
++
++/*
++ * Where the dialog opens, following the Explorer style dialog:
++ *  1. the folder part of lpstrFile
++ *  2. the folder used last, when the application passes the initial folder
++ *     it passed the first time (Windows 7 and later), or none
++ *  3. lpstrInitialDir
++ *  4. the current directory, if it has files matching the filter
++ *  5. Documents
++ */
++static void get_initial_location(const FileOpenDlgInfos *info, WCHAR **folder, WCHAR **name)
++{
++    WCHAR path[MAX_PATH], last[MAX_PATH], *file_part;
++    BOOL has_initdir = info->initdir && *info->initdir;
++
++    *folder = *name = NULL;
++
++    if (info->filename && *info->filename)
++    {
++        if (wcspbrk(info->filename, L"\\/:") && GetFullPathNameW(info->filename, MAX_PATH, path, &file_part))
++        {
++            if (file_part)
++            {
++                *name = wcsdup(file_part);
++                *file_part = 0;
++            }
++            if (PathIsDirectoryW(path)) *folder = wcsdup(path);
++        }
++        else *name = wcsdup(info->filename);
++    }
++
++    if (*folder) return;
++
++    if (has_initdir ? COMDLG32_UseLastFolder(info->initdir, last) : COMDLG32_GetLastFolder(last))
++    {
++        *folder = wcsdup(last);
++        return;
++    }
++
++    if (has_initdir && GetFullPathNameW(info->initdir, MAX_PATH, path, NULL) && PathFileExistsW(path))
++    {
++        if (!PathIsDirectoryW(path)) PathRemoveFileSpecW(path);
++        *folder = wcsdup(path);
++        return;
++    }
++
++    if (current_dir_has_files(info->filter) && GetCurrentDirectoryW(MAX_PATH, path))
++        *folder = wcsdup(path);
++    else if (SHGetFolderPathW(NULL, CSIDL_PERSONAL, NULL, 0, path) == S_OK)
++        *folder = wcsdup(path);
++}
++
++/* "name\0spec\0...\0\0" into filter specs; the specs point into the strings */
++static COMDLG_FILTERSPEC *parse_filters(const WCHAR *custom, const WCHAR *filter, UINT *count, BOOL *has_custom)
++{
++    COMDLG_FILTERSPEC *specs;
++    const WCHAR *p;
++    UINT n = 0;
++
++    *count = 0;
++    *has_custom = custom && *custom && custom[lstrlenW(custom) + 1];
++    for (p = filter; p && *p; )
++    {
++        n++;
++        p += lstrlenW(p) + 1;
++        if (!*p) break; /* a name without a spec ends the list */
++        p += lstrlenW(p) + 1;
++    }
++    if (*has_custom) n++;
++    if (!n || !(specs = calloc(n, sizeof(*specs)))) return NULL;
++
++    if (*has_custom)
++    {
++        specs[*count].pszName = custom;
++        specs[(*count)++].pszSpec = custom + lstrlenW(custom) + 1;
++    }
++    for (p = filter; p && *p; )
++    {
++        specs[*count].pszName = p;
++        p += lstrlenW(p) + 1;
++        specs[(*count)++].pszSpec = p;
++        if (!*p) break;
++        p += lstrlenW(p) + 1;
++    }
++    return specs;
++}
++
++static void set_initial_folder(IFileDialog *dialog, const WCHAR *folder)
++{
++    IShellItem *item;
++
++    if (folder && SUCCEEDED(SHCreateItemFromParsingName(folder, NULL, &IID_IShellItem, (void **)&item)))
++    {
++        IFileDialog_SetFolder(dialog, item);
++        IShellItem_Release(item);
++    }
++}
++
++static void add_readonly_choice(IFileDialogCustomize *custom)
++{
++    WCHAR open[64], readonly[64];
++
++    LoadStringW(COMDLG32_hInstance, IDS_OPEN_BUTTON, open, ARRAY_SIZE(open));
++    LoadStringW(COMDLG32_hInstance, IDS_OPEN_READONLY, readonly, ARRAY_SIZE(readonly));
++    IFileDialogCustomize_EnableOpenDropDown(custom, IDC_OPEN_DROPDOWN);
++    IFileDialogCustomize_AddControlItem(custom, IDC_OPEN_DROPDOWN, OPEN_ITEM_NORMAL, open);
++    IFileDialogCustomize_AddControlItem(custom, IDC_OPEN_DROPDOWN, OPEN_ITEM_READONLY, readonly);
++}
++
++/* file system paths of the chosen items, all in the same folder */
++static WCHAR **get_result_paths(IFileDialog *dialog, BOOL multi, UINT *count)
++{
++    IFileOpenDialog *open_dialog;
++    IShellItemArray *array = NULL;
++    IShellItem *item;
++    WCHAR **paths = NULL;
++    DWORD n = 0, i;
++
++    *count = 0;
++    if (multi && SUCCEEDED(IFileDialog_QueryInterface(dialog, &IID_IFileOpenDialog, (void **)&open_dialog)))
++    {
++        if (FAILED(IFileOpenDialog_GetResults(open_dialog, &array))) array = NULL;
++        IFileOpenDialog_Release(open_dialog);
++    }
++
++    if (array)
++    {
++        if (SUCCEEDED(IShellItemArray_GetCount(array, &n)) && n && (paths = calloc(n, sizeof(*paths))))
++        {
++            for (i = 0; i < n; i++)
++            {
++                if (FAILED(IShellItemArray_GetItemAt(array, i, &item))) continue;
++                if (SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &paths[*count]))) (*count)++;
++                IShellItem_Release(item);
++            }
++        }
++        IShellItemArray_Release(array);
++    }
++    else if (SUCCEEDED(IFileDialog_GetResult(dialog, &item)))
++    {
++        if ((paths = calloc(1, sizeof(*paths))) && SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &paths[0])))
++            *count = 1;
++        IShellItem_Release(item);
++    }
++    return paths;
++}
++
++static void free_result_paths(WCHAR **paths, UINT count)
++{
++    UINT i;
++
++    for (i = 0; i < count; i++) CoTaskMemFree(paths[i]);
++    free(paths);
++}
++
++/*
++ * The result in lpstrFile: the full path, or for several files the folder
++ * followed by the file names, each NUL terminated, ending with an empty
++ * string. Returns the length including the terminators, and the offsets of
++ * the (first) file name and of its extension.
++ */
++static WCHAR *build_result(WCHAR **paths, UINT count, UINT *len, UINT *name_offset, UINT *ext_offset)
++{
++    WCHAR *result, *p, *ext;
++    UINT i, dir_len;
++
++    if (count == 1)
++    {
++        *len = lstrlenW(paths[0]) + 1;
++        if (!(result = malloc((*len + 1) * sizeof(WCHAR)))) return NULL;
++        lstrcpyW(result, paths[0]);
++        result[*len] = 0;
++        *name_offset = PathFindFileNameW(result) - result;
++        ext = PathFindExtensionW(result);
++        *ext_offset = *ext ? ext - result + 1 : 0;
++        return result;
++    }
++
++    dir_len = PathFindFileNameW(paths[0]) - paths[0];
++    if (dir_len > 1 && paths[0][dir_len - 1] == '\\' && paths[0][dir_len - 2] != ':') dir_len--;
++    *len = dir_len + 1;
++    for (i = 0; i < count; i++) *len += lstrlenW(PathFindFileNameW(paths[i])) + 1;
++    (*len)++;
++    if (!(result = malloc(*len * sizeof(WCHAR)))) return NULL;
++
++    memcpy(result, paths[0], dir_len * sizeof(WCHAR));
++    p = result + dir_len;
++    *p++ = 0;
++    for (i = 0; i < count; i++)
++    {
++        lstrcpyW(p, PathFindFileNameW(paths[i]));
++        p += lstrlenW(p) + 1;
++    }
++    *p = 0;
++    *name_offset = dir_len + 1;
++    *ext_offset = 0;
++    return result;
++}
++
++static BOOL store_result(FileOpenDlgInfos *info, const WCHAR *result, UINT len, UINT name_offset, UINT ext_offset)
++{
++    OPENFILENAMEW *ofn = info->ofnInfos;
++
++    if (info->unicode)
++    {
++        if (len > ofn->nMaxFile)
++        {
++            if (ofn->lpstrFile && ofn->nMaxFile >= 2) *(WORD *)ofn->lpstrFile = len;
++            COMDLG32_SetCommDlgExtendedError(FNERR_BUFFERTOOSMALL);
++            return FALSE;
++        }
++        memcpy(ofn->lpstrFile, result, len * sizeof(WCHAR));
++        ofn->nFileOffset = name_offset;
++        ofn->nFileExtension = ext_offset;
++    }
++    else
++    {
++        OPENFILENAMEA *ofna = (OPENFILENAMEA *)ofn;
++        int size = WideCharToMultiByte(CP_ACP, 0, result, len, NULL, 0, NULL, NULL);
++
++        if (size > (int)ofna->nMaxFile)
++        {
++            if (ofna->lpstrFile && ofna->nMaxFile >= 2) *(WORD *)ofna->lpstrFile = size;
++            COMDLG32_SetCommDlgExtendedError(FNERR_BUFFERTOOSMALL);
++            return FALSE;
++        }
++        WideCharToMultiByte(CP_ACP, 0, result, len, ofna->lpstrFile, ofna->nMaxFile, NULL, NULL);
++        /* the offsets count bytes */
++        ofna->nFileOffset = WideCharToMultiByte(CP_ACP, 0, result, name_offset, NULL, 0, NULL, NULL);
++        ofna->nFileExtension = ext_offset ? WideCharToMultiByte(CP_ACP, 0, result, ext_offset, NULL, 0, NULL, NULL) : 0;
++    }
++    return TRUE;
++}
++
++static BOOL get_result(FileOpenDlgInfos *info, IFileDialog *dialog, BOOL save, IFileDialogCustomize *custom,
++        BOOL has_custom_filter)
++{
++    OPENFILENAMEW *ofn = info->ofnInfos;
++    UINT count, len, name_offset, ext_offset, index;
++    WCHAR **paths, *result, *ext;
++    DWORD item;
++    BOOL ret;
++
++    paths = get_result_paths(dialog, !save && (ofn->Flags & OFN_ALLOWMULTISELECT), &count);
++    if (!count || !(result = build_result(paths, count, &len, &name_offset, &ext_offset)))
++    {
++        free_result_paths(paths, count);
++        COMDLG32_SetCommDlgExtendedError(CDERR_GENERALCODES);
++        return FALSE;
++    }
++
++    if ((ret = store_result(info, result, len, name_offset, ext_offset)))
++    {
++        if (SUCCEEDED(IFileDialog_GetFileTypeIndex(dialog, &index)))
++            ofn->nFilterIndex = has_custom_filter ? index - 1 : index;
++
++        ofn->Flags &= ~(OFN_EXTENSIONDIFFERENT | OFN_READONLY);
++        ext = PathFindExtensionW(paths[0]);
++        if (count == 1 && info->defext && (!*ext || lstrcmpiW(ext + 1, info->defext)))
++            ofn->Flags |= OFN_EXTENSIONDIFFERENT;
++        if (custom && SUCCEEDED(IFileDialogCustomize_GetSelectedControlItem(custom, IDC_OPEN_DROPDOWN, &item))
++                && item == OPEN_ITEM_READONLY)
++            ofn->Flags |= OFN_READONLY;
++
++        COMDLG32_SaveLastFolder(paths[0]);
++        if (!(ofn->Flags & OFN_NOCHANGEDIR))
++        {
++            PathRemoveFileSpecW(paths[0]);
++            SetCurrentDirectoryW(paths[0]);
++        }
++    }
++
++    free(result);
++    free_result_paths(paths, count);
++    return ret;
++}
++
++static DWORD get_dialog_options(DWORD flags, BOOL save)
++{
++    static const struct { DWORD ofn, fos; } map[] =
++    {
++        { OFN_FILEMUSTEXIST,      FOS_FILEMUSTEXIST },
++        { OFN_PATHMUSTEXIST,      FOS_PATHMUSTEXIST },
++        { OFN_OVERWRITEPROMPT,    FOS_OVERWRITEPROMPT },
++        { OFN_CREATEPROMPT,       FOS_CREATEPROMPT },
++        { OFN_NODEREFERENCELINKS, FOS_NODEREFERENCELINKS },
++        { OFN_NOVALIDATE,         FOS_NOVALIDATE },
++        { OFN_NOREADONLYRETURN,   FOS_NOREADONLYRETURN },
++        { OFN_NOTESTFILECREATE,   FOS_NOTESTFILECREATE },
++        { OFN_DONTADDTORECENT,    FOS_DONTADDTORECENT },
++        { OFN_FORCESHOWHIDDEN,    FOS_FORCESHOWHIDDEN },
++        { OFN_SHAREAWARE,         FOS_SHAREAWARE },
++    };
++    /* the current directory is handled here, as GetOpenFileName does */
++    DWORD fos = FOS_NOCHANGEDIR | FOS_FORCEFILESYSTEM;
++    UINT i;
++
++    for (i = 0; i < ARRAY_SIZE(map); i++)
++        if (flags & map[i].ofn) fos |= map[i].fos;
++    if (!save && (flags & OFN_ALLOWMULTISELECT)) fos |= FOS_ALLOWMULTISELECT;
++    return fos;
++}
++
++/*
++ * Shows the item dialog for GetOpenFileName/GetSaveFileName.
++ * Returns FALSE if the Explorer style dialog has to be used instead,
++ * otherwise *ret is the result of the call.
++ */
++BOOL FILEDLG95_ShowItemDialog(FileOpenDlgInfos *info, BOOL save, BOOL *ret)
++{
++    OPENFILENAMEW *ofn = info->ofnInfos;
++    IFileDialogCustomize *custom = NULL;
++    COMDLG_FILTERSPEC *specs;
++    IFileDialog *dialog;
++    WCHAR *folder, *name;
++    BOOL has_custom_filter;
++    UINT spec_count;
++    HRESULT hr, init;
++
++    if (!use_item_dialog(info)) return FALSE;
++
++    /* the dialog needs a single threaded apartment */
++    init = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
++    if (init == RPC_E_CHANGED_MODE)
++    {
++        TRACE("thread is in a multithreaded apartment, using the Explorer style dialog\n");
++        return FALSE;
++    }
++
++    hr = save ? FileSaveDialog_Constructor(NULL, &IID_IFileDialog, (void **)&dialog)
++              : FileOpenDialog_Constructor(NULL, &IID_IFileDialog, (void **)&dialog);
++    if (FAILED(hr))
++    {
++        ERR("failed to create the item dialog, hr %#lx\n", hr);
++        if (SUCCEEDED(init)) CoUninitialize();
++        return FALSE;
++    }
++
++    TRACE("flags %#lx, filter index %lu, initial dir %s, file %s\n", ofn->Flags, ofn->nFilterIndex,
++            debugstr_w(info->initdir), debugstr_w(info->filename));
++
++    IFileDialog_SetOptions(dialog, get_dialog_options(ofn->Flags, save));
++    if (info->title) IFileDialog_SetTitle(dialog, info->title);
++    if (info->defext) IFileDialog_SetDefaultExtension(dialog, info->defext);
++
++    if ((specs = parse_filters(info->customfilter, info->filter, &spec_count, &has_custom_filter)))
++    {
++        IFileDialog_SetFileTypes(dialog, spec_count, specs);
++        IFileDialog_SetFileTypeIndex(dialog, has_custom_filter ? ofn->nFilterIndex + 1 : max(ofn->nFilterIndex, 1));
++    }
++
++    get_initial_location(info, &folder, &name);
++    TRACE("opening %s, file name %s\n", debugstr_w(folder), debugstr_w(name));
++    set_initial_folder(dialog, folder);
++    if (name && *name) IFileDialog_SetFileName(dialog, name);
++
++    if (!save && !(ofn->Flags & OFN_HIDEREADONLY)
++            && SUCCEEDED(IFileDialog_QueryInterface(dialog, &IID_IFileDialogCustomize, (void **)&custom)))
++        add_readonly_choice(custom);
++
++    hr = IFileDialog_Show(dialog, ofn->hwndOwner);
++    if (hr == S_OK)
++        *ret = get_result(info, dialog, save, custom, has_custom_filter);
++    else
++    {
++        if (hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
++        {
++            ERR("dialog failed, hr %#lx\n", hr);
++            COMDLG32_SetCommDlgExtendedError(CDERR_DIALOGFAILURE);
++        }
++        *ret = FALSE;
++    }
++
++    if (custom) IFileDialogCustomize_Release(custom);
++    IFileDialog_Release(dialog);
++    free(specs);
++    free(folder);
++    free(name);
++    if (SUCCEEDED(init)) CoUninitialize();
++    return TRUE;
++}
+diff --git a/dlls/comdlg32/filedlgbrowser.h b/dlls/comdlg32/filedlgbrowser.h
+index ad40853b..5521a16b 100644
+--- a/dlls/comdlg32/filedlgbrowser.h
++++ b/dlls/comdlg32/filedlgbrowser.h
+@@ -96,6 +96,8 @@ typedef struct
+     LPITEMIDLIST places[5];
+ } FileOpenDlgInfos;
+ 
++BOOL FILEDLG95_ShowItemDialog(FileOpenDlgInfos *info, BOOL save, BOOL *ret);
++
+ /***********************************************************************
+  * Control IDs
+  */
+@@ -117,6 +119,9 @@ typedef struct
+ #define IDS_REPORTVIEW                  153
+ #define IDS_TODESKTOP                   154
+ #define IDS_THUMBNAILVIEW               155
++#define IDS_OPEN_BUTTON                 156
++#define IDS_OPEN_READONLY               157
++#define IDS_VIEW_MENU                   158
+ 
+ #define IDC_OPENREADONLY                chx1
+ 

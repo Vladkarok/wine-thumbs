@@ -29,6 +29,26 @@ patched_proton_dir() { echo "$PATCHED_DIR/$1-$(patch_hash)"; }
 # true while a Wine process runs from the directory
 dir_in_use() { grep -qsF "$1/" /proc/[0-9]*/maps; }
 
+# the launcher's link, which the prefix's DLL links go through
+CURRENT_LINK=${WINE_THUMBS_LINK:-$HOME/.local/share/lastwar/proton-current}
+
+# remove patched copies other than $1 that no game runs from and that the
+# launcher's link does not point at
+prune_patched_dirs() {
+    local dir linked
+    linked=$(readlink -f "$CURRENT_LINK" 2>/dev/null)
+    for dir in "$PATCHED_DIR"/*/; do
+        dir=${dir%/}
+        [ -d "$dir" ] && [ "$dir" != "$1" ] && [ "$dir" != "$linked" ] || continue
+        if dir_in_use "$dir"; then
+            echo "wine-thumbs: keeping $dir, still in use"
+        else
+            rm -rf "$dir"
+            echo "wine-thumbs: removed $dir"
+        fi
+    done
+}
+
 notify() {
     echo "wine-thumbs: $*"
     command -v notify-send >/dev/null && notify-send -a wine-thumbs "Эскизы в диалоге файлов" "$*" || true

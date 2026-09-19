@@ -1,0 +1,623 @@
+From 590daf6cd01f9b24d16e389b30a8ffc303471593 Mon Sep 17 00:00:00 2001
+From: wine-thumbs <wine-thumbs@localhost>
+Date: Fri, 18 Sep 2026 20:56:45 +0200
+Subject: [PATCH 5/7] shell32: Fix the background menu and remember the sort
+ order of each folder.
+
+The View, Arrange Icons and New submenus of the background context menu
+had ids outside of the FCIDM_BASE range, so merging the menu dropped them,
+and the commands that remained were forwarded to the view with the merge
+offset still applied. The submenus now use ids in that range and the
+view gets the real command ids; the current view mode and sort order are
+marked, and Auto Arrange and Line up Icons work.
+
+Arrange Icons gains Ascending and Descending. The column and direction a
+folder is sorted by are kept per folder (HKCU\Software\Wine\Shell\
+FolderSort) and restored when the folder is shown again, in every view
+mode, and the details view header shows the sort arrow. Dates and sizes
+start with the newest and biggest, names sort naturally ("2" before
+"10") and file sizes no longer overflow the comparison.
+---
+ dlls/shell32/Makefile.in     |   1 +
+ dlls/shell32/shell32.rc      |  19 ++--
+ dlls/shell32/shlview.c       | 172 ++++++++++++++++++++++++++++-------
+ dlls/shell32/shlview_cmenu.c |   2 +-
+ dlls/shell32/shlview_sort.c  | 149 ++++++++++++++++++++++++++++++
+ dlls/shell32/shlview_sort.h  |  29 ++++++
+ dlls/shell32/shresdef.h      |  13 +++
+ 7 files changed, 343 insertions(+), 42 deletions(-)
+ create mode 100644 dlls/shell32/shlview_sort.c
+ create mode 100644 dlls/shell32/shlview_sort.h
+
+diff --git a/dlls/shell32/Makefile.in b/dlls/shell32/Makefile.in
+index 3112d64a..9cc226eb 100644
+--- a/dlls/shell32/Makefile.in
++++ b/dlls/shell32/Makefile.in
+@@ -97,6 +97,7 @@ SOURCES = \
+ 	shlmenu.c \
+ 	shlview.c \
+ 	shlview_cmenu.c \
++	shlview_sort.c \
+ 	shlview_thumbs.c \
+ 	shpolicy.c \
+ 	systray.c
+diff --git a/dlls/shell32/shell32.rc b/dlls/shell32/shell32.rc
+index 07896bd7..6d5cd87a 100644
+--- a/dlls/shell32/shell32.rc
++++ b/dlls/shell32/shell32.rc
+@@ -40,7 +40,7 @@ MENU_002 MENUEX
+ BEGIN
+ 	POPUP ""
+ 	BEGIN
+-	  POPUP "&View",                0x40   /* Submenus need ids <= FCIDM_SHVIEWLAST so they don't get removed by MergeMenu */
++	  POPUP "&View",                IDM_SHVIEW_VIEW_MENU
+ 	  BEGIN
+ 	    MENUITEM "Lar&ge Icons",	FCIDM_SHVIEW_BIGICON
+ 	    MENUITEM "S&mall Icons",	FCIDM_SHVIEW_SMALLICON
+@@ -49,12 +49,15 @@ BEGIN
+ 	    MENUITEM "&Thumbnails",	FCIDM_SHVIEW_THUMBNAIL
+ 	  END
+ 	  MENUITEM SEPARATOR
+-	  POPUP "Arrange &Icons",       0x41
++	  POPUP "Arrange &Icons",       IDM_SHVIEW_ARRANGE_MENU
+ 	  BEGIN
+-	    MENUITEM "By &Name",	0x30	/* column 0 */
+-	    MENUITEM "By &Type",	0x32	/* column 2 */
+-	    MENUITEM "By &Size",	0x31	/* ... */
+-	    MENUITEM "By &Date",	0x33
++	    MENUITEM "By &Name",	IDM_SHVIEW_SORT_NAME
++	    MENUITEM "By &Type",	IDM_SHVIEW_SORT_TYPE
++	    MENUITEM "By &Size",	IDM_SHVIEW_SORT_SIZE
++	    MENUITEM "By &Date",	IDM_SHVIEW_SORT_DATE
++	    MENUITEM SEPARATOR
++	    MENUITEM "&Ascending",	IDM_SHVIEW_SORT_ASCENDING
++	    MENUITEM "D&escending",	IDM_SHVIEW_SORT_DESCENDING
+ 	    MENUITEM SEPARATOR
+ 	    MENUITEM "&Auto Arrange",	FCIDM_SHVIEW_AUTOARRANGE
+ 	  END
+@@ -65,11 +68,9 @@ BEGIN
+ 	  MENUITEM "Paste",		FCIDM_SHVIEW_INSERT
+ 	  MENUITEM "Paste as Link",	FCIDM_SHVIEW_INSERTLINK
+ 	  MENUITEM SEPARATOR
+-	  POPUP "New",                  0x42
++	  POPUP "New",                  IDM_SHVIEW_NEW_MENU
+ 	  BEGIN
+ 	    MENUITEM "New &Folder",	FCIDM_SHVIEW_NEWFOLDER
+-	    MENUITEM "New &Link",	FCIDM_SHVIEW_NEWLINK
+-	    MENUITEM SEPARATOR
+ 	  END
+ 	  MENUITEM SEPARATOR
+ 	  MENUITEM "Properties",	FCIDM_SHVIEW_PROPERTIES
+diff --git a/dlls/shell32/shlview.c b/dlls/shell32/shlview.c
+index ced56bed..d93773d6 100644
+--- a/dlls/shell32/shlview.c
++++ b/dlls/shell32/shlview.c
+@@ -62,6 +62,7 @@
+ #include "shell32_main.h"
+ #include "shellfolder.h"
+ #include "shlview_thumbs.h"
++#include "shlview_sort.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(shell);
+ 
+@@ -146,6 +147,7 @@ typedef struct
+         POINT           ptLastMousePos; /* Mouse position at last DragOver call */
+         UINT            columns;        /* Number of shell folder columns */
+         struct thumbnail_view *thumbnails; /* Set while in FVM_THUMBNAIL mode */
++        WCHAR          *sort_key;      /* Identifies the folder for the remembered sort order */
+ } IShellViewImpl;
+ 
+ static inline IShellViewImpl *impl_from_IShellView3(IShellView3 *iface)
+@@ -511,10 +513,21 @@ static INT CALLBACK ShellView_CompareItems(LPARAM lParam1, LPARAM lParam2, LPARA
+  *	the way this function works is only usable if we had only
+  *	filesystemfolders  (25/10/99 jsch)
+  */
++static INT compare_item_names(LPCITEMIDLIST pidl1, LPCITEMIDLIST pidl2)
++{
++    WCHAR name1[MAX_PATH], name2[MAX_PATH];
++
++    _ILSimpleGetTextW(pidl1, name1, MAX_PATH);
++    _ILSimpleGetTextW(pidl2, name2, MAX_PATH);
++    /* "file2" before "file10", like Explorer */
++    return StrCmpLogicalW(name1, name2);
++}
++
+ static INT CALLBACK ShellView_ListViewCompareItems(LPVOID lParam1, LPVOID lParam2, LPARAM lpData)
+ {
+     INT nDiff=0;
+     FILETIME fd1, fd2;
++    DWORD size1, size2;
+     char strName1[MAX_PATH], strName2[MAX_PATH];
+     BOOL bIsFolder1, bIsFolder2,bIsBothFolder;
+     LPITEMIDLIST pItemIdList1 = lParam1;
+@@ -539,7 +552,7 @@ static INT CALLBACK ShellView_ListViewCompareItems(LPVOID lParam1, LPVOID lParam
+         {
+             _ILGetFileDateTime(pItemIdList1, &fd1);
+             _ILGetFileDateTime(pItemIdList2, &fd2);
+-            nDiff = CompareFileTime(&fd2, &fd1);
++            nDiff = CompareFileTime(&fd1, &fd2);
+         }
+         /* Sort by Attribute: Folder or Files can be sorted */
+         else if(pSortInfo->nHeaderID == LISTVIEW_COLUMN_ATTRIB)
+@@ -551,15 +564,14 @@ static INT CALLBACK ShellView_ListViewCompareItems(LPVOID lParam1, LPVOID lParam
+         /* Sort by FileName: Folder or Files can be sorted */
+         else if(pSortInfo->nHeaderID == LISTVIEW_COLUMN_NAME || bIsBothFolder)
+         {
+-            /* Sort by Text */
+-            _ILSimpleGetText(pItemIdList1, strName1, MAX_PATH);
+-            _ILSimpleGetText(pItemIdList2, strName2, MAX_PATH);
+-            nDiff = lstrcmpiA(strName1, strName2);
++            nDiff = compare_item_names(pItemIdList1, pItemIdList2);
+         }
+         /* Sort by File Size, Only valid for Files */
+         else if(pSortInfo->nHeaderID == LISTVIEW_COLUMN_SIZE)
+         {
+-            nDiff = (INT)(_ILGetFileSize(pItemIdList1, NULL, 0) - _ILGetFileSize(pItemIdList2, NULL, 0));
++            size1 = _ILGetFileSize(pItemIdList1, NULL, 0);
++            size2 = _ILGetFileSize(pItemIdList2, NULL, 0);
++            nDiff = size1 < size2 ? -1 : size1 > size2;
+         }
+         /* Sort by File Type, Only valid for Files */
+         else if(pSortInfo->nHeaderID == LISTVIEW_COLUMN_TYPE)
+@@ -573,11 +585,7 @@ static INT CALLBACK ShellView_ListViewCompareItems(LPVOID lParam1, LPVOID lParam
+     /*  If the Date, FileSize, FileType, Attrib was the same, sort by FileName */
+ 
+     if(nDiff == 0)
+-    {
+-        _ILSimpleGetText(pItemIdList1, strName1, MAX_PATH);
+-        _ILSimpleGetText(pItemIdList2, strName2, MAX_PATH);
+-        nDiff = lstrcmpiA(strName1, strName2);
+-    }
++        nDiff = compare_item_names(pItemIdList1, pItemIdList2);
+ 
+     if(!pSortInfo->bIsAscending)
+     {
+@@ -588,6 +596,50 @@ static INT CALLBACK ShellView_ListViewCompareItems(LPVOID lParam1, LPVOID lParam
+ 
+ }
+ 
++/* dates and sizes start with the newest and biggest, like Explorer */
++static BOOL default_sort_ascending(int column)
++{
++    return column != LISTVIEW_COLUMN_TIME && column != LISTVIEW_COLUMN_SIZE;
++}
++
++/* show the sort column and direction in the header of the details view */
++static void ShellView_UpdateSortArrows(IShellViewImpl *This)
++{
++    HWND header = (HWND)SendMessageW(This->hWndList, LVM_GETHEADER, 0, 0);
++    int i, count;
++    HDITEMW item;
++
++    if (!header) return;
++    count = SendMessageW(header, HDM_GETITEMCOUNT, 0, 0);
++    for (i = 0; i < count; i++)
++    {
++        item.mask = HDI_FORMAT;
++        if (!SendMessageW(header, HDM_GETITEMW, i, (LPARAM)&item)) continue;
++        item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
++        if (i == This->ListViewSortInfo.nHeaderID)
++            item.fmt |= This->ListViewSortInfo.bIsAscending ? HDF_SORTUP : HDF_SORTDOWN;
++        SendMessageW(header, HDM_SETITEMW, i, (LPARAM)&item);
++    }
++}
++
++/* apply the current sort order, if the user picked one */
++static void ShellView_Sort(IShellViewImpl *This)
++{
++    if (This->ListViewSortInfo.nHeaderID < 0) return;
++    SendMessageW(This->hWndList, LVM_SORTITEMS, (WPARAM)&This->ListViewSortInfo, (LPARAM)ShellView_ListViewCompareItems);
++    ShellView_UpdateSortArrows(This);
++}
++
++/* sort by a column and remember it for this folder */
++static void ShellView_SetSort(IShellViewImpl *This, int column, BOOL ascending)
++{
++    This->ListViewSortInfo.nHeaderID = column;
++    This->ListViewSortInfo.nLastHeaderID = column;
++    This->ListViewSortInfo.bIsAscending = ascending;
++    ShellView_Sort(This);
++    folder_sort_save(This->sort_key, column, ascending);
++}
++
+ /**********************************************************
+ *  LV_FindItemByPidl()
+ */
+@@ -699,6 +751,7 @@ static HRESULT ShellView_FillList(IShellViewImpl *This)
+     }
+ 
+     SendMessageW(This->hWndList, LVM_SORTITEMS, (WPARAM)This->pSFParent, (LPARAM)ShellView_CompareItems);
++    ShellView_Sort(This);
+ 
+     IFolderView2_SetRedraw(folderview, TRUE);
+ 
+@@ -726,6 +779,7 @@ static void ShellView_SetViewMode(IShellViewImpl *This, UINT mode)
+         /* thumbnails flow in rows like Explorer, the other modes keep the historical layout */
+         SetStyle(This, ViewModeToListStyle(mode) | (mode == FVM_THUMBNAIL ? LVS_ALIGNTOP : LVS_ALIGNLEFT),
+                 LVS_TYPEMASK | LVS_ALIGNMASK);
++        ShellView_UpdateSortArrows(This);
+     }
+     CheckToolbar(This);
+ }
+@@ -744,9 +798,18 @@ static LRESULT ShellView_OnCreate(IShellViewImpl *This)
+ 
+     if (ShellView_CreateList(This))
+     {
++        int column;
++        BOOL ascending;
++
+         ShellView_InitList(This);
+         if (This->FolderSettings.ViewMode == FVM_THUMBNAIL)
+             ShellView_SetViewMode(This, FVM_THUMBNAIL);
++        This->sort_key = folder_sort_key(This->pSFParent);
++        if (folder_sort_load(This->sort_key, &column, &ascending))
++        {
++            This->ListViewSortInfo.nHeaderID = This->ListViewSortInfo.nLastHeaderID = column;
++            This->ListViewSortInfo.bIsAscending = ascending;
++        }
+         ShellView_FillList(This);
+     }
+ 
+@@ -1032,6 +1095,40 @@ static HRESULT ShellView_OpenSelectedItems(IShellViewImpl * This)
+ 	return S_OK;
+ }
+ 
++/**********************************************************
++ *	mark the view mode and sort order in the background menu
++ */
++static void ShellView_CheckBackgroundMenu(IShellViewImpl *This, HMENU menu)
++{
++    static const UINT view_modes[] = { FVM_ICON, FVM_SMALLICON, FVM_LIST, FVM_DETAILS, FVM_THUMBNAIL };
++    static const UINT view_ids[] = { FCIDM_SHVIEW_BIGICON, FCIDM_SHVIEW_SMALLICON, FCIDM_SHVIEW_LISTVIEW,
++                                     FCIDM_SHVIEW_REPORTVIEW, FCIDM_SHVIEW_THUMBNAIL };
++    /* ids as merged by QueryContextMenu(FCIDM_SHVIEWFIRST) */
++    const UINT offset = FCIDM_SHVIEWFIRST - FCIDM_BASE;
++    DWORD style = GetWindowLongW(This->hWndList, GWL_STYLE);
++    int column = max(This->ListViewSortInfo.nHeaderID, LISTVIEW_COLUMN_NAME);
++    BOOL icons = (style & LVS_TYPEMASK) == LVS_ICON || (style & LVS_TYPEMASK) == LVS_SMALLICON;
++    UINT i;
++
++    for (i = 0; i < ARRAY_SIZE(view_modes); i++)
++        if (This->FolderSettings.ViewMode == view_modes[i])
++            CheckMenuRadioItem(menu, FCIDM_SHVIEW_BIGICON + offset, FCIDM_SHVIEW_THUMBNAIL + offset,
++                    view_ids[i] + offset, MF_BYCOMMAND);
++
++    if (column <= LISTVIEW_COLUMN_TIME)
++        CheckMenuRadioItem(menu, IDM_SHVIEW_SORT_NAME + offset, IDM_SHVIEW_SORT_DATE + offset,
++                IDM_SHVIEW_SORT_NAME + column + offset, MF_BYCOMMAND);
++    CheckMenuRadioItem(menu, IDM_SHVIEW_SORT_ASCENDING + offset, IDM_SHVIEW_SORT_DESCENDING + offset,
++            (This->ListViewSortInfo.bIsAscending ? IDM_SHVIEW_SORT_ASCENDING : IDM_SHVIEW_SORT_DESCENDING) + offset,
++            MF_BYCOMMAND);
++
++    CheckMenuItem(menu, FCIDM_SHVIEW_AUTOARRANGE + offset,
++            MF_BYCOMMAND | ((style & LVS_AUTOARRANGE) ? MF_CHECKED : MF_UNCHECKED));
++    EnableMenuItem(menu, FCIDM_SHVIEW_AUTOARRANGE + offset, MF_BYCOMMAND | (icons ? MF_ENABLED : MF_GRAYED));
++    EnableMenuItem(menu, FCIDM_SHVIEW_SNAPTOGRID + offset,
++            MF_BYCOMMAND | (icons && !(style & LVS_AUTOARRANGE) ? MF_ENABLED : MF_GRAYED));
++}
++
+ /**********************************************************
+  *	ShellView_DoContextMenu()
+  */
+@@ -1106,6 +1203,7 @@ static void ShellView_DoContextMenu(IShellViewImpl * This, WORD x, WORD y, BOOL
+ 
+ 	  BackgroundMenu_Constructor(This->pSFParent, FALSE, &IID_IContextMenu2, (void**)&pCM);
+ 	  IContextMenu2_QueryContextMenu(pCM, hMenu, 0, FCIDM_SHVIEWFIRST, FCIDM_SHVIEWLAST, 0);
++	  ShellView_CheckBackgroundMenu(This, hMenu);
+ 
+ 	  uCommand = TrackPopupMenu( hMenu, TPM_LEFTALIGN | TPM_RETURNCMD,x,y,0,This->hWnd,NULL);
+ 	  DestroyMenu(hMenu);
+@@ -1308,15 +1406,32 @@ static LRESULT ShellView_OnCommand(IShellViewImpl * This,DWORD dwCmdID, DWORD dw
+ 	    ShellView_SetViewMode(This, FVM_THUMBNAIL);
+ 	    break;
+ 
+-	  /* the menu IDs for sorting are 0x30... see shell32.rc */
+-	  case 0x30:
+-	  case 0x31:
+-	  case 0x32:
+-	  case 0x33:
+-            This->ListViewSortInfo.nHeaderID = dwCmdID - 0x30;
+-	    This->ListViewSortInfo.bIsAscending = TRUE;
+-	    This->ListViewSortInfo.nLastHeaderID = This->ListViewSortInfo.nHeaderID;
+-	    SendMessageW(This->hWndList, LVM_SORTITEMS, (WPARAM) &This->ListViewSortInfo, (LPARAM)ShellView_ListViewCompareItems);
++	  /* the menu IDs for sorting are IDM_SHVIEW_SORT_NAME + column, see shell32.rc */
++	  case IDM_SHVIEW_SORT_NAME:
++	  case IDM_SHVIEW_SORT_SIZE:
++	  case IDM_SHVIEW_SORT_TYPE:
++	  case IDM_SHVIEW_SORT_DATE:
++	  {
++	    int column = dwCmdID - IDM_SHVIEW_SORT_NAME;
++
++	    ShellView_SetSort(This, column, column == This->ListViewSortInfo.nHeaderID
++	            ? This->ListViewSortInfo.bIsAscending : default_sort_ascending(column));
++	    break;
++	  }
++
++	  case IDM_SHVIEW_SORT_ASCENDING:
++	  case IDM_SHVIEW_SORT_DESCENDING:
++	    ShellView_SetSort(This, max(This->ListViewSortInfo.nHeaderID, LISTVIEW_COLUMN_NAME),
++	            dwCmdID == IDM_SHVIEW_SORT_ASCENDING);
++	    break;
++
++	  case FCIDM_SHVIEW_AUTOARRANGE:
++	    SetStyle(This, (GetWindowLongW(This->hWndList, GWL_STYLE) & LVS_AUTOARRANGE) ? 0 : LVS_AUTOARRANGE,
++	            LVS_AUTOARRANGE);
++	    break;
++
++	  case FCIDM_SHVIEW_SNAPTOGRID:
++	    SendMessageW(This->hWndList, LVM_ARRANGE, LVA_SNAPTOGRID, 0);
+ 	    break;
+ 
+ 	  default:
+@@ -1403,18 +1518,8 @@ static LRESULT ShellView_OnNotify(IShellViewImpl * This, UINT CtlID, LPNMHDR lpn
+ 	    break;
+ 
+ 	  case LVN_COLUMNCLICK:
+-	    This->ListViewSortInfo.nHeaderID = lpnmlv->iSubItem;
+-	    if(This->ListViewSortInfo.nLastHeaderID == This->ListViewSortInfo.nHeaderID)
+-	    {
+-	      This->ListViewSortInfo.bIsAscending = !This->ListViewSortInfo.bIsAscending;
+-	    }
+-	    else
+-	    {
+-	      This->ListViewSortInfo.bIsAscending = TRUE;
+-	    }
+-	    This->ListViewSortInfo.nLastHeaderID = This->ListViewSortInfo.nHeaderID;
+-
+-	    SendMessageW(lpnmlv->hdr.hwndFrom, LVM_SORTITEMS, (WPARAM) &This->ListViewSortInfo, (LPARAM)ShellView_ListViewCompareItems);
++	    ShellView_SetSort(This, lpnmlv->iSubItem, lpnmlv->iSubItem == This->ListViewSortInfo.nHeaderID
++	            ? !This->ListViewSortInfo.bIsAscending : default_sort_ascending(lpnmlv->iSubItem));
+ 	    break;
+ 
+ 	  case LVN_GETDISPINFOA:
+@@ -1670,6 +1775,7 @@ static LRESULT ShellView_OnChange(IShellViewImpl * This, const LPCITEMIDLIST *pi
+         case SHCNE_CREATE:
+             pidl = ILClone(ILFindLastID(pidls[0]));
+             shellview_add_item(This, pidl);
++            ShellView_Sort(This);
+             break;
+         case SHCNE_RMDIR:
+         case SHCNE_DELETE:
+@@ -1681,6 +1787,7 @@ static LRESULT ShellView_OnChange(IShellViewImpl * This, const LPCITEMIDLIST *pi
+         case SHCNE_RENAMEFOLDER:
+         case SHCNE_RENAMEITEM:
+             LV_RenameItem(This, pidls[0], pidls[1]);
++            ShellView_Sort(This);
+             break;
+         case SHCNE_UPDATEITEM:
+ 	    break;
+@@ -1841,6 +1948,7 @@ static ULONG WINAPI IShellView_fnRelease(IShellView3 *iface)
+ 	    IShellFolder2_Release(This->pSF2Parent);
+ 
+ 	  SHFree(This->apidl);
++	  free(This->sort_key);
+ 
+ 	  if(This->pAdvSink)
+ 	    IAdviseSink_Release(This->pAdvSink);
+diff --git a/dlls/shell32/shlview_cmenu.c b/dlls/shell32/shlview_cmenu.c
+index cac33c39..4b29ca14 100644
+--- a/dlls/shell32/shlview_cmenu.c
++++ b/dlls/shell32/shlview_cmenu.c
+@@ -1498,7 +1498,7 @@ static HRESULT WINAPI BackgroundMenu_InvokeCommand(
+ 
+             default:
+                 /* if it's an id just pass it to the parent shv */
+-                if (hWnd) SendMessageA(hWnd, WM_COMMAND, MAKEWPARAM(LOWORD(lpcmi->lpVerb), 0), 0);
++                if (hWnd) SendMessageA(hWnd, WM_COMMAND, MAKEWPARAM(LOWORD(lpcmi->lpVerb) + FCIDM_BASE, 0), 0);
+                 break;
+          }
+     }
+diff --git a/dlls/shell32/shlview_sort.c b/dlls/shell32/shlview_sort.c
+new file mode 100644
+index 00000000..d9d6a6a5
+--- /dev/null
++++ b/dlls/shell32/shlview_sort.c
+@@ -0,0 +1,149 @@
++/*
++ * Per-folder sort order of the shell view
++ *
++ * The column and direction a folder was last sorted by are kept in
++ * HKCU\Software\Wine\Shell\FolderSort, one value per folder named after its
++ * desktop-absolute parsing name. Only folders the user sorted get a value;
++ * the oldest ones are dropped beyond MAX_FOLDERS.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++
++#define COBJMACROS
++
++#include "windef.h"
++#include "winbase.h"
++#include "winreg.h"
++#include "objbase.h"
++#include "shlobj.h"
++#include "wine/debug.h"
++
++#include "shlview_sort.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(shell);
++
++#define MAX_FOLDERS 500
++
++static const WCHAR folder_sort_path[] = L"Software\\Wine\\Shell\\FolderSort";
++
++struct folder_sort
++{
++    DWORD column;
++    DWORD ascending;
++    FILETIME saved;
++};
++
++WCHAR *folder_sort_key(IShellFolder *folder)
++{
++    IPersistFolder2 *persist;
++    WCHAR *name, *key = NULL;
++    ITEMIDLIST *pidl;
++
++    if (FAILED(IShellFolder_QueryInterface(folder, &IID_IPersistFolder2, (void **)&persist)))
++        return NULL;
++    if (SUCCEEDED(IPersistFolder2_GetCurFolder(persist, &pidl)))
++    {
++        if (SUCCEEDED(SHGetNameFromIDList(pidl, SIGDN_DESKTOPABSOLUTEPARSING, &name)))
++        {
++            key = wcsdup(name);
++            CoTaskMemFree(name);
++        }
++        ILFree(pidl);
++    }
++    IPersistFolder2_Release(persist);
++    return key;
++}
++
++BOOL folder_sort_load(const WCHAR *key, int *column, BOOL *ascending)
++{
++    struct folder_sort sort;
++    DWORD size = sizeof(sort);
++
++    if (!key || RegGetValueW(HKEY_CURRENT_USER, folder_sort_path, key, RRF_RT_REG_BINARY, NULL, &sort, &size)
++            || size != sizeof(sort))
++        return FALSE;
++
++    TRACE("%s: column %lu, ascending %lu\n", debugstr_w(key), sort.column, sort.ascending);
++    *column = sort.column;
++    *ascending = !!sort.ascending;
++    return TRUE;
++}
++
++struct saved_folder
++{
++    WCHAR *name;
++    FILETIME saved;
++};
++
++static int __cdecl compare_saved(const void *a, const void *b)
++{
++    return CompareFileTime(&((const struct saved_folder *)a)->saved, &((const struct saved_folder *)b)->saved);
++}
++
++/* drop the folders sorted longest ago */
++static void prune_folders(HKEY hkey, DWORD count, DWORD max_name)
++{
++    struct saved_folder *folders;
++    struct folder_sort sort;
++    DWORD i, found = 0, drop, name_len, size;
++
++    if (!(folders = calloc(count, sizeof(*folders)))) return;
++    for (i = 0; i < count; i++)
++    {
++        if (!(folders[found].name = malloc((max_name + 1) * sizeof(WCHAR)))) break;
++        name_len = max_name + 1;
++        size = sizeof(sort);
++        if (RegEnumValueW(hkey, i, folders[found].name, &name_len, NULL, NULL, (BYTE *)&sort, &size)
++                || size != sizeof(sort))
++        {
++            free(folders[found].name);
++            continue;
++        }
++        folders[found++].saved = sort.saved;
++    }
++
++    qsort(folders, found, sizeof(*folders), compare_saved);
++    drop = found > MAX_FOLDERS * 9 / 10 ? found - MAX_FOLDERS * 9 / 10 : 0;
++    for (i = 0; i < found; i++)
++    {
++        if (i < drop) RegDeleteValueW(hkey, folders[i].name);
++        free(folders[i].name);
++    }
++    free(folders);
++}
++
++void folder_sort_save(const WCHAR *key, int column, BOOL ascending)
++{
++    struct folder_sort sort;
++    DWORD count, max_name;
++    HKEY hkey;
++
++    if (!key || RegCreateKeyExW(HKEY_CURRENT_USER, folder_sort_path, 0, NULL, 0, KEY_ALL_ACCESS, NULL, &hkey, NULL))
++        return;
++
++    TRACE("%s: column %d, ascending %d\n", debugstr_w(key), column, ascending);
++    sort.column = column;
++    sort.ascending = ascending;
++    GetSystemTimeAsFileTime(&sort.saved);
++    RegSetValueExW(hkey, key, 0, REG_BINARY, (const BYTE *)&sort, sizeof(sort));
++
++    if (!RegQueryInfoKeyW(hkey, NULL, NULL, NULL, NULL, NULL, NULL, &count, &max_name, NULL, NULL, NULL)
++            && count > MAX_FOLDERS)
++        prune_folders(hkey, count, max_name);
++    RegCloseKey(hkey);
++}
+diff --git a/dlls/shell32/shlview_sort.h b/dlls/shell32/shlview_sort.h
+new file mode 100644
+index 00000000..af009b6a
+--- /dev/null
++++ b/dlls/shell32/shlview_sort.h
+@@ -0,0 +1,29 @@
++/*
++ * Per-folder sort order of the shell view
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_SHLVIEW_SORT_H
++#define __WINE_SHLVIEW_SORT_H
++
++#include "shlobj.h"
++
++/* returns a malloc()ed key identifying the folder, or NULL */
++WCHAR *folder_sort_key(IShellFolder *folder);
++BOOL folder_sort_load(const WCHAR *key, int *column, BOOL *ascending);
++void folder_sort_save(const WCHAR *key, int column, BOOL ascending);
++
++#endif /* __WINE_SHLVIEW_SORT_H */
+diff --git a/dlls/shell32/shresdef.h b/dlls/shell32/shresdef.h
+index deabe568..da2382c0 100644
+--- a/dlls/shell32/shresdef.h
++++ b/dlls/shell32/shresdef.h
+@@ -144,6 +144,19 @@
+ 
+ #define MENU_SHV_FILE 144
+ 
++/* shell view background menu (MENU_002); it is merged with command ids
++ * relative to FCIDM_BASE, so everything in it must be in that range */
++#define FCIDM_BASE                  0x7000
++#define IDM_SHVIEW_SORT_NAME        0x7060  /* + list view column */
++#define IDM_SHVIEW_SORT_SIZE        0x7061
++#define IDM_SHVIEW_SORT_TYPE        0x7062
++#define IDM_SHVIEW_SORT_DATE        0x7063
++#define IDM_SHVIEW_SORT_ASCENDING   0x7064
++#define IDM_SHVIEW_SORT_DESCENDING  0x7065
++#define IDM_SHVIEW_VIEW_MENU        0x7070
++#define IDM_SHVIEW_ARRANGE_MENU     0x7071
++#define IDM_SHVIEW_NEW_MENU         0x7072
++
+ #define MENU_CPANEL                 200
+ #define IDM_CPANEL_EXIT             201
+ #define IDM_CPANEL_ABOUT            202

@@ -1,7 +1,7 @@
-From db10c1aefa9db9bc14420f11f465f5adc8a3a49c Mon Sep 17 00:00:00 2001
+From 33c6be82ee4143c621f75aa883f046aaeaa58d97 Mon Sep 17 00:00:00 2001
 From: wine-thumbs <wine-thumbs@localhost>
 Date: Fri, 18 Sep 2026 16:19:26 +0200
-Subject: [PATCH 2/4] shell32: Keep the view mode when the ExplorerBrowser
+Subject: [PATCH 2/7] shell32: Keep the view mode when the ExplorerBrowser
  navigates.
 
 The view settings passed at initialization were reused for every new view, so a view mode picked by the user was lost on each folder change.

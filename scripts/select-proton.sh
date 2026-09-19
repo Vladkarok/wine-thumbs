@@ -12,7 +12,7 @@ set -euo pipefail
 
 build=1
 [ "${1:-}" = --no-build ] && { build=0; shift; }
-link=${1:-$HOME/.local/share/lastwar/proton-current}
+link=${1:-$CURRENT_LINK}
 
 tag=$(stock_tag)
 patched=$(patched_proton_dir "$tag")
@@ -28,4 +28,5 @@ else
 fi
 
 [ "$(readlink "$link" 2>/dev/null)" = "$target" ] || ln -sfn "$target" "$link"
+[ "$target" = "$STOCK_PROTON" ] || prune_patched_dirs "$target" > /dev/null
 echo "$target"

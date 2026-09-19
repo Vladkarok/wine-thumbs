@@ -65,3 +65,69 @@ zh_CN	&Thumbnails	缩略图(&T)
 zh_CN	Thumbnails	缩略图
 zh_TW	&Thumbnails	縮圖(&T)
 zh_TW	Thumbnails	縮圖
+uk	&Ascending	За &зростанням
+uk	D&escending	За &спаданням
+ru	&Ascending	По &возрастанию
+ru	D&escending	По у&быванию
+bg	&Ascending	&Възходящо
+bg	D&escending	&Низходящо
+sr_RS@cyrillic	&Ascending	&Растуће
+sr_RS@cyrillic	D&escending	&Опадајуће
+sr_RS@latin	&Ascending	&Rastuće
+sr_RS@latin	D&escending	&Opadajuće
+de	&Ascending	&Aufsteigend
+de	D&escending	Abs&teigend
+fr	&Ascending	&Croissant
+fr	D&escending	&Décroissant
+es	&Ascending	&Ascendente
+es	D&escending	&Descendente
+ca	&Ascending	&Ascendent
+ca	D&escending	&Descendent
+it	&Ascending	&Crescente
+it	D&escending	&Decrescente
+pt_BR	&Ascending	&Crescente
+pt_BR	D&escending	&Decrescente
+pt_PT	&Ascending	&Crescente
+pt_PT	D&escending	&Decrescente
+ro	&Ascending	&Crescător
+ro	D&escending	&Descrescător
+pl	&Ascending	&Rosnąco
+pl	D&escending	&Malejąco
+cs	&Ascending	&Vzestupně
+cs	D&escending	&Sestupně
+sk	&Ascending	&Vzostupne
+sk	D&escending	&Zostupne
+sl	&Ascending	&Naraščajoče
+sl	D&escending	&Padajoče
+hr	&Ascending	&Uzlazno
+hr	D&escending	&Silazno
+hu	&Ascending	&Növekvő
+hu	D&escending	&Csökkenő
+lt	&Ascending	&Didėjančia tvarka
+lt	D&escending	&Mažėjančia tvarka
+nl	&Ascending	&Oplopend
+nl	D&escending	Aflo&pend
+da	&Ascending	&Stigende
+da	D&escending	&Faldende
+nb_NO	&Ascending	&Stigende
+nb_NO	D&escending	S&ynkende
+sv	&Ascending	S&tigande
+sv	D&escending	&Fallande
+fi	&Ascending	&Nouseva
+fi	D&escending	&Laskeva
+el	&Ascending	&Αύξουσα
+el	D&escending	&Φθίνουσα
+tr	&Ascending	&Artan
+tr	D&escending	A&zalan
+he	&Ascending	סדר &עולה
+he	D&escending	סדר &יורד
+ar	&Ascending	&تصاعدي
+ar	D&escending	&تنازلي
+ja	&Ascending	昇順(&A)
+ja	D&escending	降順(&E)
+ko	&Ascending	오름차순(&A)
+ko	D&escending	내림차순(&E)
+zh_CN	&Ascending	递增(&A)
+zh_CN	D&escending	递减(&E)
+zh_TW	&Ascending	遞增(&A)
+zh_TW	D&escending	遞減(&E)

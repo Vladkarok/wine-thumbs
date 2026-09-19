@@ -1,7 +1,7 @@
-From a55740198fade5492def18188f7256507c310b5f Mon Sep 17 00:00:00 2001
+From 1b4587decd8e3bbcaad50ce1ef542f21ff2c3303 Mon Sep 17 00:00:00 2001
 From: wine-thumbs <wine-thumbs@localhost>
 Date: Fri, 18 Sep 2026 16:19:26 +0200
-Subject: [PATCH 3/4] comdlg32: Send toolbar control messages to the toolbar.
+Subject: [PATCH 3/7] comdlg32: Send toolbar control messages to the toolbar.
 
 IDC_TOOLBAR has the same control id as IDOK, so SendDlgItemMessage() delivered TB_CHECKBUTTON and TB_ENABLEBUTTON from the shell view to the Open button and the current view was never shown as checked.
 ---

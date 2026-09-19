@@ -1,0 +1,397 @@
+From f5fbff32b7e6c2017335dbe019d1e7a4d1befc2d Mon Sep 17 00:00:00 2001
+From: wine-thumbs <wine-thumbs@localhost>
+Date: Fri, 18 Sep 2026 20:56:45 +0200
+Subject: [PATCH 7/7] comdlg32: Add an address box and New folder and View
+ buttons to the item dialog.
+
+The item dialog did not show which folder it was in. It now has an
+address box that follows navigation and takes a path to go to, a New
+folder button and a view menu with Thumbnails, List and Details. The
+dialog also opens with the size the user last gave it.
+---
+ dlls/comdlg32/itemdlg.c | 277 +++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 271 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/comdlg32/itemdlg.c b/dlls/comdlg32/itemdlg.c
+index 3692697e..01e6b5b3 100644
+--- a/dlls/comdlg32/itemdlg.c
++++ b/dlls/comdlg32/itemdlg.c
+@@ -39,6 +39,10 @@
+ #define IDC_NAVBACK          201
+ #define IDC_NAVFORWARD       202
+ #define IDC_NAVUP            203
++#define IDC_NAVADDRESS       204
++#define IDC_CMD_TOOLBAR      205
++#define IDC_NEWFOLDER        206
++#define IDC_VIEWMENU         207
+ 
+ #include <initguid.h>
+ /* This seems to be another version of IID_IFileDialogCustomize. If
+@@ -1741,7 +1745,7 @@ static void update_layout(FileDialogImpl *This)
+     RECT dialog_rc;
+     RECT cancel_rc, dropdown_rc, open_rc;
+     RECT filetype_rc, filename_rc, filenamelabel_rc;
+-    RECT toolbar_rc, ebrowser_rc, customctrls_rc;
++    RECT toolbar_rc, ebrowser_rc, customctrls_rc, commands_rc, address_rc;
+     static const UINT vspacing = 4, hspacing = 4;
+     static const UINT min_width = 320, min_height = 200;
+     BOOL show_dropdown;
+@@ -1868,11 +1872,27 @@ static void update_layout(FileDialogImpl *This)
+         filename_rc.bottom = filename_rc.top + filename_height;
+     }
+ 
+-    hwnd = GetDlgItem(This->dlg_hwnd, IDC_NAV_TOOLBAR);
+-    if(hwnd)
++    /* Top row: navigation buttons, address box, command buttons. */
++    SetRectEmpty(&toolbar_rc);
++    SetRectEmpty(&commands_rc);
++    if((hwnd = GetDlgItem(This->dlg_hwnd, IDC_NAV_TOOLBAR)))
+     {
+         GetWindowRect(hwnd, &toolbar_rc);
+-        MapWindowPoints(NULL, This->dlg_hwnd, (POINT*)&toolbar_rc, 2);
++        OffsetRect(&toolbar_rc, dialog_rc.left + hspacing - toolbar_rc.left, dialog_rc.top + vspacing - toolbar_rc.top);
++    }
++    if((hwnd = GetDlgItem(This->dlg_hwnd, IDC_CMD_TOOLBAR)))
++    {
++        GetWindowRect(hwnd, &commands_rc);
++        OffsetRect(&commands_rc, dialog_rc.right - hspacing - commands_rc.right, toolbar_rc.top - commands_rc.top);
++    }
++    if((hwnd = GetDlgItem(This->dlg_hwnd, IDC_NAVADDRESS)))
++    {
++        int address_height = filename_rc.bottom - filename_rc.top;
++
++        address_rc.left = toolbar_rc.right + hspacing;
++        address_rc.right = max(address_rc.left, commands_rc.left - hspacing);
++        address_rc.top = toolbar_rc.top + (toolbar_rc.bottom - toolbar_rc.top - address_height) / 2;
++        address_rc.bottom = address_rc.top + address_height;
+     }
+ 
+     /* The custom controls */
+@@ -1893,7 +1913,18 @@ static void update_layout(FileDialogImpl *This)
+      */
+ 
+     /* FIXME: The Save Dialog uses a slightly different layout. */
+-    hdwp = BeginDeferWindowPos(7);
++    hdwp = BeginDeferWindowPos(10);
++
++    if(hdwp && (hwnd = GetDlgItem(This->dlg_hwnd, IDC_NAV_TOOLBAR)))
++        DeferWindowPos(hdwp, hwnd, NULL, toolbar_rc.left, toolbar_rc.top, 0, 0,
++                       SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
++    if(hdwp && (hwnd = GetDlgItem(This->dlg_hwnd, IDC_CMD_TOOLBAR)))
++        DeferWindowPos(hdwp, hwnd, NULL, commands_rc.left, commands_rc.top, 0, 0,
++                       SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
++    if(hdwp && (hwnd = GetDlgItem(This->dlg_hwnd, IDC_NAVADDRESS)))
++        DeferWindowPos(hdwp, hwnd, NULL, address_rc.left, address_rc.top,
++                       address_rc.right - address_rc.left, address_rc.bottom - address_rc.top,
++                       SWP_NOZORDER | SWP_NOACTIVATE);
+ 
+     if(hdwp && This->peb)
+         IExplorerBrowser_SetRect(This->peb, &hdwp, ebrowser_rc);
+@@ -1994,6 +2025,187 @@ static HRESULT init_explorerbrowser(FileDialogImpl *This)
+     return S_OK;
+ }
+ 
++/* size a toolbar to its buttons */
++static void fit_toolbar(HWND toolbar)
++{
++    int count = SendMessageW(toolbar, TB_BUTTONCOUNT, 0, 0);
++    RECT rc;
++
++    if (count && SendMessageW(toolbar, TB_GETITEMRECT, count - 1, (LPARAM)&rc))
++        SetWindowPos(toolbar, NULL, 0, 0, rc.right, rc.bottom, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
++}
++
++/*
++ * An address box showing the current folder, which also takes a path to
++ * go to, and a toolbar with New folder and a view menu, like the command
++ * bar of the Windows dialog.
++ */
++static void init_address_and_commands(FileDialogImpl *This, HWND hwnd, int view_images, int button_size)
++{
++    TBBUTTON button[2];
++    HWND toolbar, address;
++    HIMAGELIST images;
++    int glyph;
++
++    address = CreateWindowExW(WS_EX_CLIENTEDGE, WC_EDITW, NULL, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
++                              0, 0, 0, 0, hwnd, (HMENU)IDC_NAVADDRESS, COMDLG32_hInstance, NULL);
++    SendMessageW(address, WM_SETFONT, SendMessageW(hwnd, WM_GETFONT, 0, 0), FALSE);
++
++    toolbar = CreateWindowExW(0, TOOLBARCLASSNAMEW, NULL, TBSTYLE_FLAT | TBSTYLE_TOOLTIPS | WS_CHILD | WS_VISIBLE
++                              | CCS_NORESIZE | CCS_NOPARENTALIGN | CCS_NODIVIDER,
++                              0, 0, 0, 0, hwnd, (HMENU)IDC_CMD_TOOLBAR, NULL, NULL);
++    SendMessageW(toolbar, TB_SETEXTENDEDSTYLE, 0, TBSTYLE_EX_DRAWDDARROWS);
++
++    /* share the large view images of the navigation toolbar */
++    images = (HIMAGELIST)SendDlgItemMessageW(hwnd, IDC_NAV_TOOLBAR, TB_GETIMAGELIST, 0, 0);
++    SendMessageW(toolbar, TB_SETIMAGELIST, 0, (LPARAM)images);
++    glyph = COMDLG32_AddThumbnailsGlyph(images);
++
++    memset(button, 0, sizeof(button));
++    button[0].iBitmap = view_images + VIEW_NEWFOLDER;
++    button[0].idCommand = IDC_NEWFOLDER;
++    button[0].fsState = TBSTATE_ENABLED;
++    button[0].fsStyle = BTNS_BUTTON;
++    button[1].iBitmap = glyph >= 0 ? glyph : view_images + VIEW_LARGEICONS;
++    button[1].idCommand = IDC_VIEWMENU;
++    button[1].fsState = TBSTATE_ENABLED;
++    button[1].fsStyle = BTNS_WHOLEDROPDOWN;
++    SendMessageW(toolbar, TB_ADDBUTTONSW, ARRAY_SIZE(button), (LPARAM)button);
++    SendMessageW(toolbar, TB_SETBUTTONSIZE, 0, MAKELPARAM(button_size, button_size));
++    SendMessageW(toolbar, TB_AUTOSIZE, 0, 0);
++    fit_toolbar(toolbar);
++}
++
++static void update_address(FileDialogImpl *This)
++{
++    WCHAR *name;
++
++    if (!This->dlg_hwnd || !This->psi_folder) return;
++    if (FAILED(IShellItem_GetDisplayName(This->psi_folder, SIGDN_DESKTOPABSOLUTEEDITING, &name))) return;
++    SetDlgItemTextW(This->dlg_hwnd, IDC_NAVADDRESS, name);
++    CoTaskMemFree(name);
++}
++
++/* Enter in the address box: go to the folder typed there */
++static void on_address_enter(FileDialogImpl *This)
++{
++    WCHAR text[MAX_PATH], *current, path[MAX_PATH];
++    ITEMIDLIST *pidl = NULL;
++    SFGAOF attributes = SFGAO_FOLDER;
++
++    if (!GetDlgItemTextW(This->dlg_hwnd, IDC_NAVADDRESS, text, ARRAY_SIZE(text))) return;
++
++    /* relative paths start from the current folder, not from the desktop */
++    if (PathIsRelativeW(text) && wcsncmp(text, L"::", 2) && This->psi_folder
++            && SUCCEEDED(IShellItem_GetDisplayName(This->psi_folder, SIGDN_FILESYSPATH, &current)))
++    {
++        if (PathCombineW(path, current, text) && FAILED(SHParseDisplayName(path, NULL, &pidl, SFGAO_FOLDER, &attributes)))
++            pidl = NULL;
++        CoTaskMemFree(current);
++    }
++    if (!pidl && FAILED(SHParseDisplayName(text, NULL, &pidl, SFGAO_FOLDER, &attributes)))
++        pidl = NULL;
++
++    if (pidl && (attributes & SFGAO_FOLDER))
++    {
++        IShellView *view;
++
++        IExplorerBrowser_BrowseToIDList(This->peb, pidl, SBSP_ABSOLUTE);
++        /* like Explorer, continue in the file list */
++        if (SUCCEEDED(IExplorerBrowser_GetCurrentView(This->peb, &IID_IShellView, (void **)&view)))
++        {
++            HWND view_hwnd;
++
++            if (SUCCEEDED(IShellView_GetWindow(view, &view_hwnd))) SetFocus(view_hwnd);
++            IShellView_Release(view);
++        }
++    }
++    else
++    {
++        MessageBeep(MB_ICONWARNING);
++        update_address(This);
++    }
++    ILFree(pidl);
++}
++
++static void on_new_folder(FileDialogImpl *This)
++{
++    CMINVOKECOMMANDINFO info;
++    IContextMenu *menu;
++    IShellView *view;
++    HWND view_hwnd;
++
++    if (FAILED(IExplorerBrowser_GetCurrentView(This->peb, &IID_IShellView, (void **)&view))) return;
++    if (SUCCEEDED(IShellView_GetItemObject(view, SVGIO_BACKGROUND, &IID_IContextMenu, (void **)&menu)))
++    {
++        memset(&info, 0, sizeof(info));
++        info.cbSize = sizeof(info);
++        IShellView_GetWindow(view, &view_hwnd);
++        info.hwnd = GetParent(view_hwnd);
++        info.lpVerb = CMDSTR_NEWFOLDERA;
++        IContextMenu_InvokeCommand(menu, &info);
++        IContextMenu_Release(menu);
++    }
++    IShellView_Release(view);
++}
++
++static void show_view_menu(FileDialogImpl *This, const NMTOOLBARW *nmtb)
++{
++    static const struct { UINT mode, string; } modes[] =
++    {
++        { FVM_THUMBNAIL, IDS_THUMBNAILVIEW },
++        { FVM_LIST, IDS_LISTVIEW },
++        { FVM_DETAILS, IDS_REPORTVIEW },
++    };
++    IFolderView *view;
++    UINT i, mode = 0, chosen;
++    WCHAR text[64];
++    HMENU menu;
++    POINT pt;
++
++    if (FAILED(IExplorerBrowser_GetCurrentView(This->peb, &IID_IFolderView, (void **)&view))) return;
++    IFolderView_GetCurrentViewMode(view, &mode);
++
++    menu = CreatePopupMenu();
++    for (i = 0; i < ARRAY_SIZE(modes); i++)
++    {
++        LoadStringW(COMDLG32_hInstance, modes[i].string, text, ARRAY_SIZE(text));
++        AppendMenuW(menu, MF_STRING, modes[i].mode, text);
++    }
++    for (i = 0; i < ARRAY_SIZE(modes); i++)
++        if (modes[i].mode == mode) CheckMenuRadioItem(menu, 0, ARRAY_SIZE(modes) - 1, i, MF_BYPOSITION);
++
++    pt.x = nmtb->rcButton.left;
++    pt.y = nmtb->rcButton.bottom;
++    ClientToScreen(nmtb->hdr.hwndFrom, &pt);
++    chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pt.x, pt.y, 0, This->dlg_hwnd, NULL);
++    DestroyMenu(menu);
++
++    if (chosen) IFolderView_SetCurrentViewMode(view, chosen);
++    IFolderView_Release(view);
++}
++
++static LRESULT on_wm_notify(FileDialogImpl *This, NMHDR *hdr)
++{
++    switch (hdr->code)
++    {
++    case TBN_DROPDOWN:
++        if (((NMTOOLBARW *)hdr)->iItem == IDC_VIEWMENU)
++            show_view_menu(This, (NMTOOLBARW *)hdr);
++        break;
++    case TTN_GETDISPINFOW:
++    {
++        NMTTDISPINFOW *info = (NMTTDISPINFOW *)hdr;
++
++        info->hinst = COMDLG32_hInstance;
++        if (hdr->idFrom == IDC_NEWFOLDER) info->lpszText = MAKEINTRESOURCEW(IDS_NEWFOLDER);
++        else if (hdr->idFrom == IDC_VIEWMENU) info->lpszText = MAKEINTRESOURCEW(IDS_VIEW_MENU);
++        break;
++    }
++    }
++    return FALSE;
++}
++
+ static void init_toolbar(FileDialogImpl *This, HWND hwnd)
+ {
+     HWND htoolbar;
+@@ -2002,7 +2214,8 @@ static void init_toolbar(FileDialogImpl *This, HWND hwnd)
+     int height;
+     int navUpImgIndex;
+ 
+-    htoolbar = CreateWindowExW(0, TOOLBARCLASSNAMEW, NULL, TBSTYLE_FLAT | WS_CHILD | WS_VISIBLE,
++    htoolbar = CreateWindowExW(0, TOOLBARCLASSNAMEW, NULL, TBSTYLE_FLAT | WS_CHILD | WS_VISIBLE
++                               | CCS_NORESIZE | CCS_NOPARENTALIGN | CCS_NODIVIDER,
+                                0, 0, 0, 0,
+                                hwnd, (HMENU)IDC_NAV_TOOLBAR, NULL, NULL);
+ 
+@@ -2038,6 +2251,9 @@ static void init_toolbar(FileDialogImpl *This, HWND hwnd)
+     height = MulDiv(24, This->dpi_y, USER_DEFAULT_SCREEN_DPI);
+     SendMessageW(htoolbar, TB_SETBUTTONSIZE, 0, MAKELPARAM(height, height));
+     SendMessageW(htoolbar, TB_AUTOSIZE, 0, 0);
++    fit_toolbar(htoolbar);
++
++    init_address_and_commands(This, hwnd, navUpImgIndex - VIEW_PARENTFOLDER, height);
+ }
+ 
+ static void update_control_text(FileDialogImpl *This)
+@@ -2094,6 +2310,42 @@ static LRESULT CALLBACK dropdown_subclass_proc(HWND hwnd, UINT umessage, WPARAM
+     return CallWindowProcW((WNDPROC)GetPropW(hwnd, L"itemdlg_oldwndproc"), hwnd, umessage, wparam, lparam);
+ }
+ 
++/* The size the user last gave the dialog, kept in 96 DPI pixels; like
++ * Windows the dialog opens that big next time, centered where it was placed. */
++static void restore_dialog_size(FileDialogImpl *This)
++{
++    MONITORINFO info = { sizeof(info) };
++    DWORD size[2], len = sizeof(size);
++    int cx, cy, x, y;
++    RECT rc;
++
++    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Wine\\FileDialog", L"ItemDialogSize", RRF_RT_REG_BINARY,
++            NULL, size, &len) || len != sizeof(size))
++        return;
++    if (!GetWindowRect(This->dlg_hwnd, &rc)
++            || !GetMonitorInfoW(MonitorFromWindow(This->dlg_hwnd, MONITOR_DEFAULTTONEAREST), &info))
++        return;
++
++    cx = max(rc.right - rc.left, min(MulDiv(size[0], This->dpi_x, USER_DEFAULT_SCREEN_DPI),
++                                     info.rcWork.right - info.rcWork.left));
++    cy = max(rc.bottom - rc.top, min(MulDiv(size[1], This->dpi_y, USER_DEFAULT_SCREEN_DPI),
++                                     info.rcWork.bottom - info.rcWork.top));
++    x = max(info.rcWork.left, min((int)(rc.left + rc.right - cx) / 2, (int)info.rcWork.right - cx));
++    y = max(info.rcWork.top, min((int)(rc.top + rc.bottom - cy) / 2, (int)info.rcWork.bottom - cy));
++    SetWindowPos(This->dlg_hwnd, NULL, x, y, cx, cy, SWP_NOZORDER | SWP_NOACTIVATE);
++}
++
++static void save_dialog_size(FileDialogImpl *This)
++{
++    DWORD size[2];
++    RECT rc;
++
++    if (IsZoomed(This->dlg_hwnd) || IsIconic(This->dlg_hwnd) || !GetWindowRect(This->dlg_hwnd, &rc)) return;
++    size[0] = MulDiv(rc.right - rc.left, USER_DEFAULT_SCREEN_DPI, This->dpi_x);
++    size[1] = MulDiv(rc.bottom - rc.top, USER_DEFAULT_SCREEN_DPI, This->dpi_y);
++    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Wine\\FileDialog", L"ItemDialogSize", REG_BINARY, size, sizeof(size));
++}
++
+ static LRESULT on_wm_initdialog(HWND hwnd, LPARAM lParam)
+ {
+     FileDialogImpl *This = (FileDialogImpl*)lParam;
+@@ -2180,8 +2432,10 @@ static LRESULT on_wm_initdialog(HWND hwnd, LPARAM lParam)
+     ctrl_container_reparent(This, This->dlg_hwnd);
+     init_explorerbrowser(This);
+     init_toolbar(This, hwnd);
++    update_address(This);
+     update_control_text(This);
+     update_layout(This);
++    restore_dialog_size(This);
+ 
+     if(This->filterspec_count)
+         events_OnTypeChange(This);
+@@ -2214,6 +2468,8 @@ static LRESULT on_wm_destroy(FileDialogImpl *This)
+ {
+     TRACE("%p\n", This);
+ 
++    save_dialog_size(This);
++
+     if(This->peb)
+     {
+         IFolderView *view;
+@@ -2243,6 +2499,12 @@ static LRESULT on_idok(FileDialogImpl *This)
+ {
+     TRACE("%p\n", This);
+ 
++    if(GetFocus() == GetDlgItem(This->dlg_hwnd, IDC_NAVADDRESS))
++    {
++        on_address_enter(This);
++        return FALSE;
++    }
++
+     if(SUCCEEDED(on_default_action(This)))
+         EndDialog(This->dlg_hwnd, S_OK);
+ 
+@@ -2352,6 +2614,7 @@ static LRESULT on_wm_command(FileDialogImpl *This, WPARAM wparam, LPARAM lparam)
+     case IDC_NAVFORWARD:      return on_browse_forward(This);
+     case IDC_FILETYPE:        return on_command_filetype(This, wparam, lparam);
+     case IDC_NAVUP:           return on_browse_up(This);
++    case IDC_NEWFOLDER:       on_new_folder(This); return FALSE;
+     default:                  TRACE("Unknown command.\n");
+     }
+     return FALSE;
+@@ -2365,6 +2628,7 @@ static INT_PTR CALLBACK itemdlg_dlgproc(HWND hwnd, UINT umessage, WPARAM wparam,
+     {
+     case WM_INITDIALOG:       return on_wm_initdialog(hwnd, lparam);
+     case WM_COMMAND:          return on_wm_command(This, wparam, lparam);
++    case WM_NOTIFY:           return on_wm_notify(This, (NMHDR *)lparam);
+     case WM_SIZE:             return on_wm_size(This);
+     case WM_GETMINMAXINFO:    return on_wm_getminmaxinfo(This, lparam);
+     case WM_DESTROY:          return on_wm_destroy(This);
+@@ -3545,6 +3809,7 @@ static HRESULT WINAPI IExplorerBrowserEvents_fnOnNavigationComplete(IExplorerBro
+         This->psi_folder = NULL;
+     }
+ 
++    update_address(This);
+     events_OnFolderChange(This);
+ 
+     return S_OK;

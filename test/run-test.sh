@@ -11,6 +11,7 @@ exe=$root/test/thumbtest.exe mode=
 while :; do
     case "${1:-}" in
     --32) exe=$root/test/thumbtest32.exe; shift ;;
+    --*=*|--save|--ansi|--multi) mode="$mode $1"; shift ;;
     --itemdlg|--dpiaware) mode="$mode $1"; shift ;;
     *) break ;;
     esac

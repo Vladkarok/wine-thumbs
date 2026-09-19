@@ -1,7 +1,7 @@
-From 8565e9b4f6db9e4f0634b72c0acf6f0dc864b67b Mon Sep 17 00:00:00 2001
+From c798ea6ef5a563c7a1bb2f973cda14d1dac91940 Mon Sep 17 00:00:00 2001
 From: wine-thumbs <wine-thumbs@localhost>
 Date: Fri, 18 Sep 2026 16:19:26 +0200
-Subject: [PATCH 1/4] shell32: Add a thumbnail view mode.
+Subject: [PATCH 1/7] shell32: Add a thumbnail view mode.
 
 FVM_THUMBNAIL was accepted but drawn like the list view. Image files are
 now decoded with WIC on a small pool of background threads, downscaled
