@@ -10,10 +10,10 @@ set -euo pipefail
 . "$(dirname "$(realpath "$0")")/common.sh"
 
 tag=${1:-$(stock_tag)}
-src=$ROOT/src/ge-$tag
+src=$SRC_DIR/ge-$tag
 wine=$src/wine
-bld=$ROOT/build/ge-$tag
-out=$ROOT/out/ge-$tag
+bld=$BUILD_DIR/ge-$tag
+out=$OUT_DIR/ge-$tag
 mkdir -p "$LOG_DIR"
 
 step() { echo "wine-thumbs: $tag: $*"; }
@@ -49,10 +49,11 @@ step "applying thumbnail patches"
 git -C "$wine" am --abort > /dev/null 2>&1 || true
 git -C "$wine" reset -q --hard baseline
 git -C "$wine" clean -q -fd
-if ! git -C "$wine" am -q "$ROOT"/patches/*.patch 2> "$LOG_DIR/am-$tag.log"; then
+mapfile -t patches < <(patch_list)
+if ! git -C "$wine" am -q "${patches[@]}" 2> "$LOG_DIR/am-$tag.log"; then
     # newer trees may have moved the context around; accept some fuzz
     git -C "$wine" am --abort
-    for p in "$ROOT"/patches/*.patch; do
+    for p in "${patches[@]}"; do
         patch -d "$wine" -p1 -F3 -s --no-backup-if-mismatch < "$p" \
             || die "$(basename "$p") does not apply to $tag, the patches need a rebase"
     done

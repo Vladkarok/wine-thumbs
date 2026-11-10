@@ -29,7 +29,7 @@ fi
 if "$ROOT/scripts/build.sh" "$tag" && "$ROOT/scripts/install.sh"; then
     rm -f "$failed"
     # sources and builds of other GE releases are ~1 GB each
-    for dir in "$ROOT"/src/ge-* "$ROOT"/build/ge-* "$ROOT"/out/ge-*; do
+    for dir in "$SRC_DIR"/ge-* "$BUILD_DIR"/ge-* "$OUT_DIR"/ge-*; do
         [ -e "$dir" ] && [ "${dir##*/}" != "ge-$tag" ] && rm -rf "$dir"
     done
     "$ROOT/scripts/select-proton.sh" --no-build

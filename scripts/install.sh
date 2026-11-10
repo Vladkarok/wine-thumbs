@@ -9,7 +9,7 @@ set -euo pipefail
 . "$(dirname "$(realpath "$0")")/common.sh"
 
 tag=$(stock_tag)
-out=$ROOT/out/ge-$tag
+out=$OUT_DIR/ge-$tag
 dest=$(patched_proton_dir "$tag")
 
 [ "$(cat "$out/TAG" 2>/dev/null)" = "$tag" ] || { echo "wine-thumbs: no build for $tag, run build.sh first" >&2; exit 1; }

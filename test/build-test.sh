@@ -7,8 +7,8 @@ root=$(realpath "$(dirname "$0")/..")
 . "$root/scripts/common.sh"
 tag=${WINE_THUMBS_TAG:-$(stock_tag)}
 arch=${1:-x86_64}
-bld=$root/build/ge-$tag
-src=$root/src/ge-$tag/wine
+bld=$BUILD_DIR/ge-$tag
+src=$SRC_DIR/ge-$tag/wine
 exe=$root/test/thumbtest.exe
 [ "$arch" = i386 ] && exe=$root/test/thumbtest32.exe
 

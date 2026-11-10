@@ -1,0 +1,9 @@
+# Apply in this order. scripts/apply.sh and scripts/build.sh read this
+# file, scripts/export-patches.sh rewrites it.
+0001-shell32-Add-a-thumbnail-view-mode.patch
+0002-shell32-Keep-the-view-mode-when-the-ExplorerBrowser-.patch
+0003-comdlg32-Send-toolbar-control-messages-to-the-toolba.patch
+0004-comdlg32-Add-a-thumbnails-view-button-and-remember-t.patch
+0005-shell32-Fix-the-background-menu-and-remember-the-sor.patch
+0006-comdlg32-Use-the-item-dialog-for-GetOpenFileName-and.patch
+0007-comdlg32-Add-an-address-box-and-New-folder-and-View-.patch
